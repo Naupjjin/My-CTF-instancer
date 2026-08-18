@@ -33,6 +33,9 @@ class FakeContainer:
         return self.daemon.networks[self.network].endpoints[self.name]
 
     def start(self):
+        # A real container exists, and is not running, for as long as this takes.
+        self.daemon.starting.set()
+        time.sleep(self.daemon.start_delay)
         if self.daemon.fail_start:
             raise APIError("start failed")
         self.status = "running"
@@ -161,6 +164,8 @@ class FakeDaemon:
         self.create_kwargs = {}
         self.network_calls = 0
         self.create_delay = 0
+        self.start_delay = 0
+        self.starting = threading.Event()   # raised while a container is starting
         self.fail_start = False
         self.reject_options = False
 
@@ -178,6 +183,10 @@ class FakeClient:
 @pytest.fixture
 def daemon(monkeypatch):
     fake = FakeDaemon()
+    # Module state that outlives a request, and so would outlive a test.
+    instancer.shutting_down.clear()
+    instancer.reserved_ports.clear()
+    instancer.reserved_subnets.clear()
     monkeypatch.setattr(instancer, "_client", FakeClient(fake))
     monkeypatch.setattr(instancer, "INSTANCE_PORT_MIN", 31000)
     monkeypatch.setattr(instancer, "INSTANCE_PORT_MAX", 31010)
@@ -413,6 +422,133 @@ def test_concurrent_create_in_one_session(daemon):
     assert len(daemon.containers) == 1
     assert len(daemon.networks) == 1
     assert results[0]["key"] == results[1]["key"]
+
+
+# --- a crowd ------------------------------------------------------------------
+
+CROWD = 24
+
+
+def crowd(daemon, count=CROWD):
+    """`count` players, each with their own session, all pressing START at once."""
+    clients = []
+    for _ in range(count):
+        client = instancer.app.test_client()
+        client.get("/")
+        clients.append(client)
+    answers = []
+    run_together([lambda c=c: answers.append(c.post("/create").get_json())
+                  for c in clients])
+    return clients, answers
+
+
+def test_a_crowd_never_shares_a_resource(daemon, monkeypatch):
+    # The whole point: every player who gets an instance gets one that is
+    # entirely theirs -- port, subnet, key, container, network.
+    monkeypatch.setattr(instancer, "INSTANCE_PORT_MAX", instancer.INSTANCE_PORT_MIN + CROWD)
+    daemon.create_delay = 0.01
+    _, answers = crowd(daemon)
+    assert all(a["running"] for a in answers)
+    assert len(daemon.containers) == CROWD
+    assert len(daemon.networks) == CROWD
+
+    ports = [port_of(c) for c in daemon.containers.values()]
+    subnets = [c.labels["spawnzero.subnet"] for c in daemon.containers.values()]
+    keys = [a["key"] for a in answers]
+    assert len(set(ports)) == CROWD
+    assert len(set(subnets)) == CROWD
+    assert len(set(keys)) == CROWD
+
+
+def test_a_crowd_larger_than_the_pool_is_turned_away_not_double_booked(daemon, monkeypatch):
+    # Six ports, twenty-four players: some must be told to wait, and none of
+    # them may be handed a port that is already somebody's.
+    monkeypatch.setattr(instancer, "INSTANCE_PORT_MIN", 31000)
+    monkeypatch.setattr(instancer, "INSTANCE_PORT_MAX", 31005)
+    daemon.create_delay = 0.01
+    _, answers = crowd(daemon)
+    started = [a for a in answers if a.get("running")]
+    turned_away = [a for a in answers if not a.get("running")]
+    assert len(started) == 6
+    assert len(turned_away) == CROWD - 6
+    assert all(a["error"] == instancer.ERROR_BUSY for a in turned_away)
+    assert len({port_of(c) for c in daemon.containers.values()}) == 6
+
+
+def test_reservations_are_given_back_when_a_create_fails(daemon):
+    daemon.fail_start = True
+    web = instancer.app.test_client()
+    web.get("/")
+    web.post("/create")
+    assert instancer.reserved_ports == set()
+    assert instancer.reserved_subnets == set()
+
+
+def test_polling_status_cannot_delete_an_instance_being_built(daemon):
+    """A container is briefly "created", not "running". A poll in that window
+    used to sweep it away as stale -- while its own create was still building."""
+    web = instancer.app.test_client()
+    web.get("/")
+    poller = instancer.app.test_client()
+    poller.set_cookie("session", web.get_cookie("session").value)
+
+    daemon.start_delay = 0.3           # widen the created-but-not-running window
+    answers = []
+
+    def poll_mid_start():
+        daemon.starting.wait(2)        # land inside the window, not before it
+        answers.append(("status", poller.get("/status").get_json()))
+
+    run_together([
+        lambda: answers.append(("create", web.post("/create").get_json())),
+        poll_mid_start,
+    ])
+    created = dict(answers)["create"]
+    assert created["running"] is True
+    assert len(daemon.containers) == 1
+    assert only_container(daemon).status == "running"
+
+
+def test_the_reaper_cannot_take_a_network_out_of_a_create(daemon):
+    """The network exists a moment before the container does. The reaper used to
+    see that moment as an orphan."""
+    web = instancer.app.test_client()
+    web.get("/")
+    daemon.create_delay = 0.3
+    answers = []
+    run_together([
+        lambda: answers.append(web.post("/create").get_json()),
+        lambda: instancer.reap_expired(),
+    ])
+    assert answers[0]["running"] is True
+    assert len(daemon.containers) == 1
+    assert len(daemon.networks) == 1
+
+
+def test_the_reaper_leaves_a_rebuilt_instance_alone(daemon, monkeypatch):
+    """An expired instance destroyed and rebuilt between the reaper's listing and
+    its kill must not be reaped in its successor's place."""
+    web = instancer.app.test_client()
+    web.get("/")
+    web.post("/create", json={"ttl": 1})
+    only_container(daemon).labels["spawnzero.expires_at"] = str(int(time.time()) - 1)
+
+    # Slip a rebuild in after the reaper has listed the instance but before it
+    # takes the owner's lock -- the exact window another thread would use.
+    real_lock, rebuilt = instancer.owner_lock, []
+
+    def rebuild_first(owner):
+        if not rebuilt:
+            rebuilt.append(True)
+            web.post("/destroy")
+            web.post("/create")
+        return real_lock(owner)
+
+    monkeypatch.setattr(instancer, "owner_lock", rebuild_first)
+    instancer.reap_expired()
+
+    assert len(daemon.containers) == 1          # the fresh one survived
+    assert instancer.instance_expires_at(only_container(daemon)) > int(time.time())
 
 
 def run_together(workers):

@@ -311,6 +311,39 @@ routing table of its own, so a destroyed instance is unreachable immediately. In
 http mode each exchange gets its own upstream connection (`Connection: close`),
 because keep-alive would let a second request ride in on the first request's key.
 
+**A crowd.** Everything that can be handed out twice is handed out under a lock,
+and everything slow happens outside one. Two levels:
+
+* `pool_lock` covers *choosing* a port and a subnet, and nothing else. The choice
+  is written into `reserved_ports` / `reserved_subnets` before the lock is
+  released, because Docker only becomes the record of what is taken once the
+  container exists — a second or two later, and two players would be handed the
+  same port in that gap. The reservation is dropped in a `finally`, whether the
+  build worked or not.
+* An **owner lock**, one per session (striped, so the set is fixed rather than
+  growing with every session an event sees), covers everything that touches a
+  single instance: create, destroy, the stale-container sweep in `/status`, and
+  the reaper. Two requests about the same instance queue up instead of fighting.
+
+That second lock is not decoration. `/status` *deletes* a container it finds not
+running, and "not running yet" is exactly what a container looks like between
+being created and being started — so an unlocked poll, or a double-clicked
+START, would delete the instance being built. Same for the reaper: a create makes
+the network a moment before the container, which is precisely what an orphan
+network looks like. Both are covered by tests that fail if the locking is
+removed.
+
+Because the pool lock is never held while Docker works, creates overlap: twelve
+sessions pressing START at once finish in about three and a half seconds
+against a real daemon, all twelve with their own port, subnet, key and network.
+When the pools do run out, the extra players get `503` and nothing half-built is
+left behind — they are turned away, never double-booked.
+
+The reservations live in this process, so run one instancer process. Threads are
+fine (the dev server is threaded, which is what all of the above is for); several
+worker *processes* would each keep their own reservation set and could hand out
+the same port twice.
+
 **TTL.** `expires_at = now + ttl` is stamped on the container as a label. A
 background thread wakes every `CLEANUP_INTERVAL` seconds and destroys any
 instance past its `expires_at` (container **and** network), and prunes any

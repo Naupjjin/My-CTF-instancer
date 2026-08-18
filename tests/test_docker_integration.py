@@ -337,6 +337,34 @@ def test_the_proxy_can_reach_the_instance(web, world):
     assert dial_from(world, address_on(instance, network), port_of(instance))
 
 
+def test_a_real_crowd_never_shares_a_resource(world, monkeypatch):
+    """Twelve players pressing START at once, against the real daemon."""
+    monkeypatch.setattr(instancer, "INSTANCE_PORT_MAX", PORT_MIN + 20)
+    client = instancer.client()
+    players = []
+    for _ in range(12):
+        browser = instancer.app.test_client()
+        browser.get("/")
+        players.append(browser)
+
+    answers = []
+    threads = [threading.Thread(target=lambda b=b: answers.append(b.post("/create").get_json()))
+               for b in players]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert all(a["running"] for a in answers), answers
+    running = instances(client)
+    assert len(running) == 12
+    assert len({port_of(c) for c in running}) == 12
+    assert len({c.labels["spawnzero.subnet"] for c in running}) == 12
+    assert len({a["key"] for a in answers}) == 12
+    # and every one of them is really on a network of its own, with the proxy
+    assert len(networks(client)) == 12
+
+
 def test_two_sessions_are_strangers(web, world):
     client = instancer.client()
     other = instancer.app.test_client()

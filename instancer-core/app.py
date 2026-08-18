@@ -107,6 +107,7 @@ LABEL_KEY = "spawnzero.key"
 ERROR_BUSY = "no free instance right now, try again in a moment"
 ERROR_CREATE = "could not start your instance, try again in a moment"
 ERROR_DESTROY = "could not stop your instance, try again in a moment"
+ERROR_SHUTDOWN = "the instancer is going down, try again shortly"
 
 # How players reach the instance decides how we show the address:
 #   http   -> a clickable http://proxy:port/<key>/ link  (web challenges)
@@ -165,7 +166,42 @@ CONFIG = load_config()
 app = Flask(__name__)
 app.secret_key = SECRET_KEY or secrets.token_hex(32)
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
-lock = threading.Lock()
+
+# Two levels of locking, because the two things worth protecting cost very
+# different amounts to hold.
+#
+#   pool_lock    guards the choice of a port and a subnet, and nothing else. It
+#                is never held while Docker builds anything, so a hundred players
+#                arriving at once queue on the pick (milliseconds) instead of on
+#                each other's containers (a second or more, each).
+#
+#   owner locks  one per session: everything that touches *one* instance goes
+#                through it -- create, destroy, the stale-container sweep, the
+#                reaper. Two requests about the same instance queue up, so a
+#                double-clicked START cannot build two, and a status poll cannot
+#                delete a container that is still being started.
+#
+# The owner locks are a fixed set, picked by session id rather than a dict that
+# would grow for every session an event ever sees. Two unrelated players may
+# share one and briefly wait on each other; that is cheaper than the bookkeeping.
+pool_lock = threading.Lock()
+OWNER_STRIPES = 64
+owner_locks = [threading.Lock() for _ in range(OWNER_STRIPES)]
+
+# Claimed by a create that is still building. Docker is the record of what is in
+# use, but only once the container exists -- a second or two later. Until then
+# the claim lives here, or two players would be handed the same port.
+reserved_ports = set()
+reserved_subnets = set()
+
+# Set once a shutdown starts, so a create racing the teardown cannot leave an
+# instance behind after destroy_all() has already walked past it.
+shutting_down = threading.Event()
+
+
+def owner_lock(owner):
+    """The lock for one session. Same session, same lock."""
+    return owner_locks[hash(owner) % OWNER_STRIPES]
 
 _client = None
 
@@ -276,8 +312,8 @@ def used_ports():
             if port is not None}
 
 
-def pick_port():
-    used = used_ports()
+def pick_port(reserved=()):
+    used = used_ports() | set(reserved)
     for port in range(INSTANCE_PORT_MIN, INSTANCE_PORT_MAX + 1):
         if port not in used:
             return port
@@ -302,8 +338,8 @@ def used_subnets():
     return used
 
 
-def pick_subnet():
-    used = used_subnets()
+def pick_subnet(reserved=()):
+    used = used_subnets() + list(reserved)
     for subnet in SUBNET_POOL.subnets(new_prefix=SUBNET_PREFIX):
         if not any(subnet.overlaps(u) for u in used):
             return subnet
@@ -314,6 +350,30 @@ def pick_subnet():
 
 def pick_key():
     return secrets.token_hex(KEY_BYTES)
+
+
+# --- reservations -------------------------------------------------------------
+
+def reserve():
+    """Take a port and a subnet nobody else can be given.
+
+    Held under pool_lock only long enough to read what Docker has and write the
+    claim; the slow part -- building the network and the container -- happens
+    with the lock released, so everyone else can be picking meanwhile.
+    """
+    with pool_lock:
+        port = pick_port(reserved_ports)
+        subnet = pick_subnet(reserved_subnets)
+        reserved_ports.add(port)
+        reserved_subnets.add(subnet)
+        return port, subnet
+
+
+def release(port, subnet):
+    """Drop the claim -- either Docker holds the record now, or nothing does."""
+    with pool_lock:
+        reserved_ports.discard(port)
+        reserved_subnets.discard(subnet)
 
 
 # --- create / destroy ---------------------------------------------------------
@@ -481,17 +541,26 @@ def index():
 @app.get("/status")
 def status():
     owner = session.get("owner")
-    container = get_instance(owner) if owner else None
-    if container is None:
+    if owner is None:
         return idle_json()
-    return instance_json(container)
+    # Under the owner's lock: get_instance() sweeps away a container that is not
+    # running, and "not running yet" is what a container looks like for the
+    # moment between being created and being started. Polling while a create is
+    # in flight would otherwise delete the instance being built.
+    with owner_lock(owner):
+        container = get_instance(owner)
+        if container is None:
+            return idle_json()
+        return instance_json(container)
 
 
 @app.post("/create")
 def create():
     owner = owner_id()
     ttl = requested_ttl()
-    with lock:
+    if shutting_down.is_set():
+        return jsonify(running=False, mode=MODE, error=ERROR_SHUTDOWN), 503
+    with owner_lock(owner):
         container = get_instance(owner)
         if container is not None:
             return instance_json(container)
@@ -499,9 +568,9 @@ def create():
         # Clear any orphan network left behind by a previous life of this owner.
         remove_network(owner)
 
+        port = subnet = None
         try:
-            port = pick_port()
-            subnet = pick_subnet()
+            port, subnet = reserve()
             key = pick_key()
             expires_at = int(time.time()) + ttl
             create_network(owner, subnet)
@@ -515,11 +584,15 @@ def create():
                 remove_instance(owner)
             except (DockerException, OSError) as cleanup_exc:
                 log.error("cleanup after failed create: %s", cleanup_exc)
-            # pick_port/pick_subnet raise RuntimeError when the pools are full --
-            # the one failure a player can actually do something about (wait).
+            # reserve() raises RuntimeError when the pools are full -- the one
+            # failure a player can actually do something about (wait).
             if isinstance(exc, RuntimeError):
                 return jsonify(running=False, mode=MODE, error=ERROR_BUSY), 503
             return jsonify(running=False, mode=MODE, error=ERROR_CREATE), 500
+        finally:
+            # Either the container exists and Docker records the claim, or
+            # nothing does; either way ours is no longer needed.
+            release(port, subnet)
 
         log.info("instance created for %s: %s port %d, subnet %s, ttl %ds",
                  owner, instance_address(container) or "?", port, subnet, ttl)
@@ -531,7 +604,7 @@ def destroy():
     owner = session.get("owner")
     if owner is None:
         return idle_json()
-    with lock:
+    with owner_lock(owner):
         try:
             removed = remove_instance(owner)
         except Exception as exc:
@@ -564,15 +637,28 @@ def route(key):
 
 def reap_expired():
     """Destroy expired instances and drop networks whose container is gone."""
-    now = int(time.time())
-    with lock:
-        for container in list_instances():
-            owner = instance_owner(container)
-            expires_at = instance_expires_at(container)
-            if expires_at is not None and now >= expires_at:
-                log.info("instance for %s expired, destroying", owner)
-                remove_instance(owner)
-        prune_orphan_networks()
+    for container in list_instances():
+        owner = instance_owner(container)
+        if instance_expires_at(container) is None:
+            continue
+        with owner_lock(owner):
+            # Read it again under the lock: between the listing and here, this
+            # owner may have destroyed and rebuilt, and the new one is not ours
+            # to take.
+            if not expired(owner):
+                continue
+            log.info("instance for %s expired, destroying", owner)
+            remove_instance(owner)
+    prune_orphan_networks()
+
+
+def expired(owner):
+    try:
+        container = client().containers.get(container_name(owner))
+    except NotFound:
+        return False
+    expires_at = instance_expires_at(container)
+    return expires_at is not None and int(time.time()) >= expires_at
 
 
 def prune_orphan_networks():
@@ -580,9 +666,15 @@ def prune_orphan_networks():
         if not network.name.startswith(NETWORK_PREFIX):
             continue
         owner = network.name[len(NETWORK_PREFIX):]
-        try:
-            client().containers.get(container_name(owner))
-        except NotFound:
+        # A create makes the network first and the container a moment later.
+        # Without the owner's lock this is exactly the window in which an
+        # instance being built looks like an orphan.
+        with owner_lock(owner):
+            try:
+                client().containers.get(container_name(owner))
+                continue
+            except NotFound:
+                pass
             log.info("removing orphan network %s", network.name)
             detach_proxy(network)
             try:
@@ -592,22 +684,30 @@ def prune_orphan_networks():
 
 
 def destroy_all():
-    """Tear down every instance there is. The end of the line for a shutdown."""
-    held = lock.acquire(timeout=SHUTDOWN_LOCK_WAIT)
-    try:
-        for container in list_instances():
-            owner = instance_owner(container)
+    """Tear down every instance there is.
+
+    Each one still goes through its owner's lock, but only briefly: Docker's
+    grace period is short, and being late is worse than being rude to a create
+    that is already doomed. Callers who mean "we are going away" raise
+    `shutting_down` first, so a create arriving now is turned away instead of
+    building something this walk has already passed.
+    """
+    for container in list_instances():
+        owner = instance_owner(container)
+        held = owner_lock(owner).acquire(timeout=SHUTDOWN_LOCK_WAIT)
+        try:
             log.info("shutting down: destroying instance of %s", owner)
             remove_instance(owner)
-        prune_orphan_networks()
-    finally:
-        if held:
-            lock.release()
+        finally:
+            if held:
+                owner_lock(owner).release()
+    prune_orphan_networks()
 
 
 def handle_shutdown(signum, frame):
     """SIGTERM/SIGINT: what `docker compose down` and Ctrl-C arrive as."""
     log.info("signal %d received, shutting down", signum)
+    shutting_down.set()
     if REAP_ON_SHUTDOWN:
         try:
             destroy_all()

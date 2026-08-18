@@ -95,10 +95,10 @@
   #state { font-size: 11px; color: var(--rose); }
   #state.online { color: var(--sage); }
 
-  #address { color: var(--ink); text-decoration: none; word-break: break-all;
-             border-bottom: 2px dotted var(--accent); cursor: pointer; padding: 0 2px; }
-  #address:hover { background: var(--accent-s); }
-  #prompt { color: var(--accent); }
+  .copy { color: var(--ink); text-decoration: none; word-break: break-all;
+          border-bottom: 2px dotted var(--accent); cursor: pointer; padding: 0 2px; }
+  .copy:hover { background: var(--accent-s); }
+  .prompt { color: var(--accent); }
   .cursor { display: inline-block; width: 9px; height: 17px; background: var(--ink);
             vertical-align: -3px; margin-left: 2px; animation: blink .9s steps(1) infinite; }
 
@@ -167,7 +167,17 @@
 
       <div class="row" id="addr-row" hidden>
         <span class="lbl pixel">ADDR</span>
-        <span><span id="prompt">&gt;</span> <a id="address"></a></span>
+        <span><span class="prompt">&gt;</span> <a id="address" class="copy"></a></span>
+      </div>
+
+      <div class="row" id="key-row" hidden>
+        <span class="lbl pixel">KEY</span>
+        <span><span class="prompt">&gt;</span> <a id="key" class="copy"></a></span>
+      </div>
+
+      <div class="row" id="hint-row" hidden>
+        <span class="lbl pixel"></span>
+        <span class="muted" id="hint"></span>
       </div>
 
       <div class="row" id="ttl-row" hidden>
@@ -191,9 +201,12 @@
 </div>
 
 <script>
-// Injected by Flask. TTL lifetime is decided by the server (docker-compose).
+// Injected by Flask. TTL lifetime and the proxy address are decided by the
+// server (docker-compose); an empty PROXY_HOST means "the host serving this page".
 const MODE = {{ mode|tojson }};
 const DEFAULT_TTL = {{ default_ttl }};
+const PROXY_HOST = {{ proxy_host|tojson }};
+const PROXY_PORT = {{ proxy_port }};
 
 const boot = document.getElementById("boot");
 const term = document.getElementById("console");
@@ -201,6 +214,10 @@ const led = document.getElementById("led");
 const state = document.getElementById("state");
 const addrRow = document.getElementById("addr-row");
 const address = document.getElementById("address");
+const keyRow = document.getElementById("key-row");
+const key = document.getElementById("key");
+const hintRow = document.getElementById("hint-row");
+const hint = document.getElementById("hint");
 const ttlRow = document.getElementById("ttl-row");
 const remaining = document.getElementById("remaining");
 const ttlcfg = document.getElementById("ttlcfg");
@@ -216,6 +233,7 @@ const BOOT_LINES = [
   "PIX-DOS 2.0  soft systems (c) 199X",
   "MEM CHECK ........ 640K OK",
   "DOCKER LINK ...... <b>ONLINE</b>",
+  "PROXY LINK ....... <b>" + (PROXY_HOST || "LOCAL") + ":" + PROXY_PORT + "</b>",
   "MODE ............. <b>" + MODE.toUpperCase() + "</b>",
   "READY.",
 ];
@@ -236,12 +254,16 @@ function typewriter(lines, done) {
 }
 
 /* ---------- rendering ---------- */
-function formatAddress(mode, port) {
-  const host = location.hostname;
+function formatAddress(mode, host, port, key) {
+  // Everything goes through the one proxy port; the key says which instance.
   if (mode === "netcat") return { text: "nc " + host + " " + port, href: null };
-  const url = "http://" + host + ":" + port;
+  const url = "http://" + host + ":" + port + "/" + key + "/";
   return { text: url, href: url };
 }
+const HINTS = {
+  netcat: "connect, then paste the key at the prompt",
+  http:   "the link carries the key; a cookie keeps it after that",
+};
 function fmt(sec) {
   sec = Math.max(0, sec);
   const m = Math.floor(sec / 60), s = sec % 60;
@@ -261,20 +283,26 @@ function runClock(sec) {
 }
 function render(data) {
   if (data.running) {
-    const a = formatAddress(data.mode || MODE, data.port);
+    const mode = data.mode || MODE;
+    const host = data.proxy_host || location.hostname;
+    const a = formatAddress(mode, host, data.proxy_port || PROXY_PORT, data.key);
     led.classList.add("on");
     state.textContent = "ONLINE"; state.classList.add("online");
     address.textContent = a.text;
     if (a.href) { address.href = a.href; address.target = "_blank"; }
     else { address.removeAttribute("href"); address.title = "click to copy"; }
-    addrRow.hidden = false;
+    key.textContent = data.key || "";
+    key.title = "click to copy";
+    hint.textContent = HINTS[mode] || "";
+    addrRow.hidden = false; keyRow.hidden = false; hintRow.hidden = false;
     if (typeof data.remaining_time === "number") { ttlRow.hidden = false; runClock(data.remaining_time); }
     start.hidden = true; stop.hidden = false;
   } else {
     if (countdown) { clearInterval(countdown); countdown = null; }
     led.classList.remove("on");
     state.textContent = "OFFLINE"; state.classList.remove("online");
-    addrRow.hidden = true; ttlRow.hidden = true;
+    addrRow.hidden = true; keyRow.hidden = true; hintRow.hidden = true;
+    ttlRow.hidden = true;
     start.hidden = false; stop.hidden = true;
   }
 }
@@ -295,13 +323,15 @@ const refresh = () => call("/status", "GET");
 start.onclick = () => call("/create", "POST");   // no ttl -> server DEFAULT_TTL
 stop.onclick  = () => call("/destroy", "POST");
 
-// click the netcat address to copy it
-address.addEventListener("click", (e) => {
-  if (address.hasAttribute("href")) return;
-  e.preventDefault();
-  navigator.clipboard && navigator.clipboard.writeText(address.textContent);
-  const old = address.textContent; address.textContent = "[COPIED]";
-  setTimeout(() => { address.textContent = old; }, 700);
+// click a copyable field (the netcat address, the key) to put it on the clipboard
+document.querySelectorAll(".copy").forEach((el) => {
+  el.addEventListener("click", (e) => {
+    if (el.hasAttribute("href")) return;   // a real link: let it open
+    e.preventDefault();
+    navigator.clipboard && navigator.clipboard.writeText(el.textContent);
+    const old = el.textContent; el.textContent = "[COPIED]";
+    setTimeout(() => { el.textContent = old; }, 700);
+  });
 });
 
 /* ---------- go ---------- */

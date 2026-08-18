@@ -1,11 +1,20 @@
+# Two containers and one network of our own:
+#
+#   instancer  the web UI, the only thing that talks to the Docker socket
+#   proxy      the only way to an instance, on one published port
+#   control    where those two find each other; instances are never on it
+#
+# Every instance gets its own internal network instead, with the proxy attached
+# to it. See README.md for why that is the whole security story.
 services:
   instancer:
     build:
       context: .
       dockerfile: Dockerfile.instancer
-    # Host networking: the ports handed out to players and the ports the
-    # instancer bind-checks must be the same network namespace.
-    network_mode: host
+    ports:
+      - "${LISTEN_PORT:-5000}:${LISTEN_PORT:-5000}"
+    networks:
+      control:
     volumes:
       - ./challenge:/challenge:ro
       - /var/run/docker.sock:/var/run/docker.sock
@@ -13,19 +22,29 @@ services:
       # Keep this stable (e.g. in a .env file): it signs the session cookies
       # that decide who owns which instance across restarts.
       SECRET_KEY: ${SECRET_KEY:-}
-      PORT_MIN: 30000
-      PORT_MAX: 30100
+      # Shared with the proxy: what the proxy shows to prove a key lookup is
+      # really coming from it. Change it in .env for anything but a local run.
+      PROXY_TOKEN: ${PROXY_TOKEN:-dev-proxy-token}
+      PROXY_CONTAINER: ctf-proxy
+      PROXY_PORT: ${PROXY_PORT:-1337}
+      # Set this only when players reach the proxy under a different name than
+      # this page (a second host, a DNS name). Empty = same host as the UI.
+      PROXY_HOST: ${PROXY_HOST:-}
+      LISTEN_PORT: ${LISTEN_PORT:-5000}
       CHALLENGE_DIR: /challenge
       CHALLENGE_IMAGE: ctf-challenge:latest
       # The challenge image is built once, only if missing, so startup is instant
       # on every boot after the first. Set FORCE_BUILD=1 after editing the
       # challenge to rebuild it on the next start.
       # FORCE_BUILD: 1
-      # This challenge is a pwn service: xinetd serves the binary over raw TCP
-      # on 41240, so players connect with netcat, not a browser.
-      CONTAINER_PORT: 41240
-      MODE: netcat
-      # Each instance gets its own /24 out of this pool.
+      # This challenge is a pwn service: xinetd serves the binary over raw TCP,
+      # so players connect with netcat, not a browser.
+      MODE: ${MODE:-netcat}
+      # Each instance gets its own port out of this range. The port only exists
+      # inside the instance's own network, so it collides with nothing on the host.
+      INSTANCE_PORT_MIN: 30000
+      INSTANCE_PORT_MAX: 30100
+      # ...and its own /24 out of this pool.
       SUBNET_POOL: 10.240.0.0/16
       SUBNET_PREFIX: 24
       # Instance TTL (seconds): how long each instance lives before the reaper
@@ -35,5 +54,34 @@ services:
       # Hard ceiling for a TTL requested via the API; and how often the reaper runs.
       MAX_TTL: 86400
       CLEANUP_INTERVAL: 10
-      LISTEN_PORT: 5000
+    depends_on:
+      - proxy
     restart: unless-stopped
+
+  proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile.proxy
+    # Fixed name and fixed address: the instancer attaches this container to
+    # every instance network, and the proxy binds this one address so that the
+    # instance networks it joins have nothing to connect back to.
+    container_name: ctf-proxy
+    ports:
+      - "${PROXY_PORT:-1337}:${PROXY_PORT:-1337}"
+    networks:
+      control:
+        ipv4_address: 10.239.0.10
+    environment:
+      PROXY_BIND: 10.239.0.10
+      PROXY_PORT: ${PROXY_PORT:-1337}
+      PROXY_TOKEN: ${PROXY_TOKEN:-dev-proxy-token}
+      INSTANCER_URL: http://instancer:${LISTEN_PORT:-5000}
+      MODE: ${MODE:-netcat}
+    restart: unless-stopped
+
+networks:
+  control:
+    name: ctf-control
+    ipam:
+      config:
+        - subnet: 10.239.0.0/24

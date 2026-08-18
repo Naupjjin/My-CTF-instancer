@@ -3,6 +3,8 @@ services:
     build: ./
     volumes:
       - ./share:/home/chal:ro
-      - ./xinetd:/etc/xinetd.d/chal:ro
+      - ./xinetd.template:/etc/xinetd.d/chal.template:ro
+    environment:
+      CHAL_PORT: 41240
     ports:
       - 41240:41240

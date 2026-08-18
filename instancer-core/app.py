@@ -1,17 +1,24 @@
 """Minimal CTF instancer.
 
-One challenge, one instance per browser session. Each instance gets its own
-bridge network (a unique /24 out of a pool) and a TTL after which a background
-thread reaps it. All state lives in Docker itself — container/network names and
-labels — so a restart of this process re-discovers everything instead of
-duplicating it.
+One challenge, one instance per browser session. Creating an instance hands out
+four things that belong to nobody else:
+
+  * a container,
+  * a /24 bridge network -- internal, and without a gateway address, so the
+    instance can route to nothing at all except the proxy dialling in,
+  * a port inside that network,
+  * a key.
+
+Nothing is published to the host: the only way to an instance is the proxy
+(proxy-core/proxy.py), which trades a key for an address. All state lives in
+Docker itself -- container/network names and labels -- so a restart of this
+process re-discovers everything instead of duplicating it.
 """
 
 import ipaddress
 import logging
 import os
 import secrets
-import socket
 import threading
 import time
 
@@ -19,20 +26,50 @@ import docker
 from docker.errors import APIError, DockerException, ImageNotFound, NotFound
 from flask import Flask, jsonify, render_template, request, session
 
-PORT_MIN = int(os.environ.get("PORT_MIN", "30000"))
-PORT_MAX = int(os.environ.get("PORT_MAX", "30100"))
+# The port an instance listens on, inside its own network. Never published, so
+# the range only has to be big enough for the instances running at once -- it
+# cannot collide with anything on the host.
+INSTANCE_PORT_MIN = int(os.environ.get("INSTANCE_PORT_MIN", "30000"))
+INSTANCE_PORT_MAX = int(os.environ.get("INSTANCE_PORT_MAX", "30100"))
+
 CHALLENGE_DIR = os.environ.get("CHALLENGE_DIR", "/challenge")
 CHALLENGE_IMAGE = os.environ.get("CHALLENGE_IMAGE", "ctf-challenge:latest")
 FORCE_BUILD = os.environ.get("FORCE_BUILD", "").lower() in ("1", "true", "yes")
-CONTAINER_PORT = int(os.environ.get("CONTAINER_PORT", "8080"))
 LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "5000"))
 SECRET_KEY = os.environ.get("SECRET_KEY")
 CONTAINER_PREFIX = "ctf-instance-"
 NETWORK_PREFIX = "ctf-network-"
 
+# The proxy: one container, one published port, attached to every instance
+# network by us. PROXY_HOST is only needed when players reach the proxy under a
+# different name than the instancer -- empty means "same host as this page".
+PROXY_CONTAINER = os.environ.get("PROXY_CONTAINER", "ctf-proxy")
+PROXY_HOST = os.environ.get("PROXY_HOST", "")
+PROXY_PORT = int(os.environ.get("PROXY_PORT", "1337"))
+PROXY_TOKEN = os.environ.get("PROXY_TOKEN", "")
+
+# Keys are what a player sends to the proxy, so they are the only credential in
+# the system: long enough not to be guessed, short enough to paste.
+KEY_BYTES = int(os.environ.get("KEY_BYTES", "16"))
+
+# The environment variable that tells the challenge which port to listen on.
+PORT_ENV = os.environ.get("PORT_ENV", "CHAL_PORT")
+
+# Blast radius of one instance. Empty or 0 leaves the limit to Docker.
+MEM_LIMIT = os.environ.get("MEM_LIMIT", "512m")
+PIDS_LIMIT = int(os.environ.get("PIDS_LIMIT", "256") or 0)
+
 # One /24 per instance, carved out of this pool.
 SUBNET_POOL = ipaddress.ip_network(os.environ.get("SUBNET_POOL", "10.100.0.0/16"))
 SUBNET_PREFIX = int(os.environ.get("SUBNET_PREFIX", "24"))
+
+# Docker >= 28 can leave the bridge without a gateway address. That is what
+# keeps an instance off the host: with no gateway it has a route to its own /24
+# and to nothing else -- not the host, not the control network, not another
+# instance. Older daemons reject the option; we fall back to a plain internal
+# network, which still blocks routing but leaves the gateway address reachable.
+GATEWAY_MODE_OPTION = "com.docker.network.bridge.gateway_mode_ipv4"
+NETWORK_OPTIONS = {GATEWAY_MODE_OPTION: "isolated"}
 
 # TTL: how long an instance lives, and how often the reaper looks.
 DEFAULT_TTL = int(os.environ.get("DEFAULT_TTL", "3600"))
@@ -43,10 +80,12 @@ CLEANUP_INTERVAL = int(os.environ.get("CLEANUP_INTERVAL", "10"))
 LABEL_OWNER = "ctf.owner"
 LABEL_EXPIRES = "ctf.expires_at"
 LABEL_SUBNET = "ctf.subnet"
+LABEL_PORT = "ctf.port"
+LABEL_KEY = "ctf.key"
 
 # How players reach the instance decides how we show the address:
-#   http   -> a clickable http://host:port link  (web challenges)
-#   netcat -> an nc host port command            (pwn / raw-tcp challenges)
+#   http   -> a clickable http://proxy:port/<key>/ link  (web challenges)
+#   netcat -> an nc proxy port command, then the key     (pwn / raw-tcp)
 MODE = os.environ.get("MODE", "http").lower()
 if MODE not in ("http", "netcat"):
     logging.getLogger("instancer").warning("unknown MODE %r, falling back to http", MODE)
@@ -92,7 +131,7 @@ def get_instance(owner):
     """Return this session's running container, or None.
 
     A leftover stopped container (and its network) is removed so the name,
-    port and subnet are free again.
+    port, subnet and key are free again.
     """
     try:
         container = client().containers.get(container_name(owner))
@@ -105,19 +144,34 @@ def get_instance(owner):
     return container
 
 
-def instance_port(container):
-    bindings = container.attrs["NetworkSettings"]["Ports"].get("%d/tcp" % CONTAINER_PORT)
-    if not bindings:
+def label(container, name):
+    return (container.labels or {}).get(name)
+
+
+def label_int(container, name):
+    try:
+        return int(label(container, name))
+    except (TypeError, ValueError):
         return None
-    return int(bindings[0]["HostPort"])
+
+
+def instance_owner(container):
+    return label(container, LABEL_OWNER) or container.name[len(CONTAINER_PREFIX):]
+
+
+def instance_port(container):
+    return label_int(container, LABEL_PORT)
 
 
 def instance_expires_at(container):
-    raw = (container.labels or {}).get(LABEL_EXPIRES)
-    try:
-        return int(raw)
-    except (TypeError, ValueError):
-        return None
+    return label_int(container, LABEL_EXPIRES)
+
+
+def instance_address(container):
+    """The instance's address on its own network -- what the proxy dials."""
+    networks = (container.attrs.get("NetworkSettings") or {}).get("Networks") or {}
+    endpoint = networks.get(network_name(instance_owner(container))) or {}
+    return endpoint.get("IPAddress") or None
 
 
 def list_instances():
@@ -126,35 +180,41 @@ def list_instances():
             if c.name.startswith(CONTAINER_PREFIX)]
 
 
-# --- host ports ---------------------------------------------------------------
+def find_by_key(key):
+    """The running instance a key belongs to, or None.
 
-def docker_used_ports():
-    """Host ports published by any running container."""
-    used = set()
-    for container in client().containers.list():
-        ports = container.attrs["NetworkSettings"]["Ports"] or {}
-        for bindings in ports.values():
-            for binding in bindings or []:
-                used.add(int(binding["HostPort"]))
-    return used
+    Compared in constant time and against running containers only, so a key
+    stops working the moment its instance does.
+    """
+    if not key or not key.isascii():
+        return None
+    for container in list_instances():
+        if container.status != "running":
+            continue
+        if secrets.compare_digest(label(container, LABEL_KEY) or "", key):
+            return container
+    return None
 
 
-def port_is_free(port):
-    """True if nothing on this host is bound to the port right now."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        try:
-            sock.bind(("0.0.0.0", port))
-        except OSError:
-            return False
-    return True
+# --- ports --------------------------------------------------------------------
+
+def used_ports():
+    """Ports already handed to an instance.
+
+    Only instances can hold one: the port lives inside the instance's own
+    network namespace, so nothing else on the host can be in the way.
+    """
+    return {port for port in (instance_port(c) for c in list_instances())
+            if port is not None}
 
 
 def pick_port():
-    used = docker_used_ports()
-    for port in range(PORT_MIN, PORT_MAX + 1):
-        if port not in used and port_is_free(port):
+    used = used_ports()
+    for port in range(INSTANCE_PORT_MIN, INSTANCE_PORT_MAX + 1):
+        if port not in used:
             return port
-    raise RuntimeError("no free host port in %d-%d" % (PORT_MIN, PORT_MAX))
+    raise RuntimeError("no free instance port in %d-%d"
+                       % (INSTANCE_PORT_MIN, INSTANCE_PORT_MAX))
 
 
 # --- subnets ------------------------------------------------------------------
@@ -182,13 +242,64 @@ def pick_subnet():
     raise RuntimeError("no free /%d subnet in %s" % (SUBNET_PREFIX, SUBNET_POOL))
 
 
+# --- keys ---------------------------------------------------------------------
+
+def pick_key():
+    return secrets.token_hex(KEY_BYTES)
+
+
 # --- create / destroy ---------------------------------------------------------
 
-def remove_network(owner):
+def create_network(owner, subnet):
+    """The instance's own network: internal, and ideally without a gateway."""
+    kwargs = dict(
+        driver="bridge",
+        internal=True,
+        ipam=docker.types.IPAMConfig(
+            pool_configs=[docker.types.IPAMPool(subnet=str(subnet))]),
+        labels={LABEL_OWNER: owner, LABEL_SUBNET: str(subnet)},
+        check_duplicate=True,
+    )
     try:
-        client().networks.get(network_name(owner)).remove()
+        return client().networks.create(network_name(owner),
+                                        options=NETWORK_OPTIONS, **kwargs)
+    except APIError as exc:
+        log.warning("daemon rejected %s=isolated (%s); the instance network keeps "
+                    "a reachable gateway address -- upgrade to Docker 28+ to close it",
+                    GATEWAY_MODE_OPTION, exc)
+        return client().networks.create(network_name(owner), **kwargs)
+
+
+def attach_proxy(owner):
+    """Give the proxy an interface on this instance's network.
+
+    The proxy answers only on its control-network address, so this is a one-way
+    door: the proxy can dial the instance, the instance finds nothing listening.
+    """
+    client().networks.get(network_name(owner)).connect(PROXY_CONTAINER)
+
+
+def detach_proxy(network):
+    """Best effort: a half-built instance may never have got the proxy attached.
+
+    A detach that really was needed and really failed is not swallowed -- the
+    removal right after it fails loudly with "has active endpoints".
+    """
+    try:
+        network.disconnect(PROXY_CONTAINER, force=True)
+    except (NotFound, APIError) as exc:
+        log.debug("proxy not detached from %s: %s", network.name, exc)
+
+
+def remove_network(owner):
+    """Remove this owner's network. Docker refuses while the proxy is attached."""
+    try:
+        network = client().networks.get(network_name(owner))
     except NotFound:
-        pass
+        return
+    detach_proxy(network)
+    try:
+        network.remove()
     except APIError as exc:
         log.error("could not remove network for %s: %s", owner, exc)
 
@@ -206,6 +317,29 @@ def remove_instance(owner):
         pass
     remove_network(owner)
     return removed
+
+
+def create_container(owner, port, subnet, key, expires_at):
+    limits = {}
+    if MEM_LIMIT:
+        limits["mem_limit"] = MEM_LIMIT
+    if PIDS_LIMIT:
+        limits["pids_limit"] = PIDS_LIMIT
+    return client().containers.create(
+        CHALLENGE_IMAGE,
+        name=container_name(owner),
+        # No ports=: publishing one would be a way in that skips the proxy.
+        network=network_name(owner),
+        environment={PORT_ENV: str(port)},
+        labels={
+            LABEL_OWNER: owner,
+            LABEL_EXPIRES: str(expires_at),
+            LABEL_SUBNET: str(subnet),
+            LABEL_PORT: str(port),
+            LABEL_KEY: key,
+        },
+        **limits,
+    )
 
 
 def image_exists():
@@ -245,11 +379,19 @@ def instance_json(container):
     remaining = max(0, expires_at - int(time.time())) if expires_at is not None else None
     return jsonify(
         running=True,
-        port=instance_port(container),
         mode=MODE,
+        key=label(container, LABEL_KEY),
+        proxy_host=PROXY_HOST or None,
+        proxy_port=PROXY_PORT,
+        port=instance_port(container),
         expires_at=expires_at,
         remaining_time=remaining,
     )
+
+
+def idle_json():
+    return jsonify(running=False, mode=MODE,
+                   proxy_host=PROXY_HOST or None, proxy_port=PROXY_PORT)
 
 
 # --- routes -------------------------------------------------------------------
@@ -259,7 +401,8 @@ def index():
     # Mint the session here, so two fast clicks on Start cannot race each other
     # into two identities (and therefore two containers).
     owner_id()
-    return render_template("index.html", mode=MODE, default_ttl=DEFAULT_TTL)
+    return render_template("index.html", mode=MODE, default_ttl=DEFAULT_TTL,
+                           proxy_host=PROXY_HOST, proxy_port=PROXY_PORT)
 
 
 @app.get("/status")
@@ -267,7 +410,7 @@ def status():
     owner = session.get("owner")
     container = get_instance(owner) if owner else None
     if container is None:
-        return jsonify(running=False, mode=MODE)
+        return idle_json()
     return instance_json(container)
 
 
@@ -283,30 +426,14 @@ def create():
         # Clear any orphan network left behind by a previous life of this owner.
         remove_network(owner)
 
-        container = None
         try:
             port = pick_port()
             subnet = pick_subnet()
+            key = pick_key()
             expires_at = int(time.time()) + ttl
-            client().networks.create(
-                network_name(owner),
-                driver="bridge",
-                ipam=docker.types.IPAMConfig(
-                    pool_configs=[docker.types.IPAMPool(subnet=str(subnet))]),
-                labels={LABEL_OWNER: owner, LABEL_SUBNET: str(subnet)},
-                check_duplicate=True,
-            )
-            container = client().containers.create(
-                CHALLENGE_IMAGE,
-                name=container_name(owner),
-                ports={"%d/tcp" % CONTAINER_PORT: port},
-                network=network_name(owner),
-                labels={
-                    LABEL_OWNER: owner,
-                    LABEL_EXPIRES: str(expires_at),
-                    LABEL_SUBNET: str(subnet),
-                },
-            )
+            create_network(owner, subnet)
+            attach_proxy(owner)
+            container = create_container(owner, port, subnet, key, expires_at)
             container.start()
             container.reload()
         except Exception as exc:
@@ -317,8 +444,8 @@ def create():
                 log.error("cleanup after failed create: %s", cleanup_exc)
             return jsonify(running=False, error=str(exc), mode=MODE), 500
 
-        log.info("instance created for %s: host %d -> container %d, subnet %s, ttl %ds",
-                 owner, port, CONTAINER_PORT, subnet, ttl)
+        log.info("instance created for %s: %s port %d, subnet %s, ttl %ds",
+                 owner, instance_address(container) or "?", port, subnet, ttl)
         return instance_json(container)
 
 
@@ -326,7 +453,7 @@ def create():
 def destroy():
     owner = session.get("owner")
     if owner is None:
-        return jsonify(running=False, mode=MODE)
+        return idle_json()
     with lock:
         try:
             removed = remove_instance(owner)
@@ -335,7 +462,25 @@ def destroy():
             return jsonify(running=True, error=str(exc), mode=MODE), 500
     if removed:
         log.info("instance destroyed for %s", owner)
-    return jsonify(running=False, mode=MODE)
+    return idle_json()
+
+
+@app.get("/internal/route/<key>")
+def route(key):
+    """Key -> instance address. The proxy is the only caller.
+
+    Turning a key into an address is the whole authority in this system, so the
+    call carries a shared token; without it -- or with a key nobody owns -- the
+    answer is the same 404, and the proxy has nowhere to send the player.
+    """
+    presented = request.headers.get("X-Proxy-Token", "")
+    if not PROXY_TOKEN or not secrets.compare_digest(presented, PROXY_TOKEN):
+        return jsonify(error="not found"), 404
+    container = find_by_key(key)
+    host = instance_address(container) if container is not None else None
+    if host is None:
+        return jsonify(error="not found"), 404
+    return jsonify(host=host, port=instance_port(container))
 
 
 # --- TTL reaper ---------------------------------------------------------------
@@ -345,8 +490,7 @@ def reap_expired():
     now = int(time.time())
     with lock:
         for container in list_instances():
-            owner = (container.labels or {}).get(LABEL_OWNER) \
-                or container.name[len(CONTAINER_PREFIX):]
+            owner = instance_owner(container)
             expires_at = instance_expires_at(container)
             if expires_at is not None and now >= expires_at:
                 log.info("instance for %s expired, destroying", owner)
@@ -363,6 +507,7 @@ def prune_orphan_networks():
             client().containers.get(container_name(owner))
         except NotFound:
             log.info("removing orphan network %s", network.name)
+            detach_proxy(network)
             try:
                 network.remove()
             except APIError as exc:
@@ -390,15 +535,17 @@ def startup():
     if not SECRET_KEY:
         log.warning("SECRET_KEY not set: sessions, and with them instance ownership, "
                     "are lost when the instancer restarts")
+    if not PROXY_TOKEN:
+        log.warning("PROXY_TOKEN not set: every key lookup is refused, so no player "
+                    "can get through the proxy")
     build_image()
     for container in list_instances():
-        owner = (container.labels or {}).get(LABEL_OWNER, "?")
-        log.info("adopted instance of %s (%s), expires_at=%s",
-                 owner, container.status, instance_expires_at(container))
-    log.info("server started on port %d (mode=%s, container port %d, host ports %d-%d, "
-             "subnet pool %s /%d, default ttl %ds)",
-             LISTEN_PORT, MODE, CONTAINER_PORT, PORT_MIN, PORT_MAX,
-             SUBNET_POOL, SUBNET_PREFIX, DEFAULT_TTL)
+        log.info("adopted instance of %s (%s), expires_at=%s", instance_owner(container),
+                 container.status, instance_expires_at(container))
+    log.info("server started on port %d (mode=%s, proxy %s:%d via %s, instance ports "
+             "%d-%d, subnet pool %s /%d, default ttl %ds)",
+             LISTEN_PORT, MODE, PROXY_HOST or "<this host>", PROXY_PORT, PROXY_CONTAINER,
+             INSTANCE_PORT_MIN, INSTANCE_PORT_MAX, SUBNET_POOL, SUBNET_PREFIX, DEFAULT_TTL)
 
 
 if __name__ == "__main__":

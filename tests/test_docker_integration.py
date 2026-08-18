@@ -1,27 +1,46 @@
-"""Integration tests: the real Docker daemon and the real challenge image.
+"""Integration tests: the real Docker daemon, the real proxy, the real challenge.
 
+The instancer runs in-process (a Flask server in a thread, so the proxy
+container can call it back); everything else is what production runs.
 Skipped automatically when no Docker daemon is reachable.
 """
 
-import importlib.util
+import ipaddress
 import socket
+import threading
 import time
 from pathlib import Path
 
 import pytest
+from werkzeug.serving import make_server
 
 import app as instancer
 
 REPO = Path(__file__).resolve().parents[1]
 IMAGE = "ctf-challenge:test"
+PROXY_IMAGE = "ctf-proxy:test"
 PREFIX = "ctf-instance-test-"
 NET_PREFIX = "ctf-network-test-"
 SECRET = "integration-test-secret"
+TOKEN = "integration-test-token"
+
+# The proxy's own turf: one network shared with the instancer, one fixed address
+# it binds, one published port players arrive on.
+CONTROL_NET = "ctf-control-test"
+CONTROL_SUBNET = "10.239.9.0/24"
+PROXY_NAME = "ctf-proxy-test"
+PROXY_IP = "10.239.9.10"
+PROXY_PORT = 1337
+PROXY_HOST_PORT = 31337
+
 PORT_MIN = 30000
 PORT_MAX = 30005
+SUBNET_POOL = "10.241.0.0/16"
 
 docker = pytest.importorskip("docker")
 
+
+# --- the world under test -----------------------------------------------------
 
 @pytest.fixture(scope="module")
 def real_client():
@@ -32,23 +51,115 @@ def real_client():
         pytest.skip("no reachable Docker daemon: %s" % exc)
     remove_leftovers(client)
     client.images.build(path=str(REPO / "challenge"), tag=IMAGE, rm=True)
+    client.images.build(path=str(REPO), dockerfile="Dockerfile.proxy",
+                        tag=PROXY_IMAGE, rm=True)
     yield client
     remove_leftovers(client)
     client.images.remove(IMAGE, force=True)
+    client.images.remove(PROXY_IMAGE, force=True)
+
+
+@pytest.fixture(scope="module")
+def world(real_client):
+    """Configure the instancer, serve it, and put the proxy in front of it."""
+    saved = {name: getattr(instancer, name) for name in CONFIG}
+    for name, value in CONFIG.items():
+        setattr(instancer, name, value)
+    instancer.app.secret_key = SECRET
+
+    control = real_client.networks.create(
+        CONTROL_NET, driver="bridge",
+        ipam=docker.types.IPAMConfig(
+            pool_configs=[docker.types.IPAMPool(subnet=CONTROL_SUBNET)]))
+    gateway = control.attrs["IPAM"]["Config"][0]["Gateway"]
+
+    # The proxy asks the instancer where a key leads, so the instancer has to be
+    # listening before the proxy starts -- it reaches us over the control gateway.
+    server = make_server("0.0.0.0", 0, instancer.app, threaded=True)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    port = server.socket.getsockname()[1]
+    proxy = start_proxy(real_client, "http://%s:%d" % (gateway, port))
+
+    yield proxy
+    server.shutdown()
+    proxy.remove(force=True)
+    control.remove()
+    for name, value in saved.items():
+        setattr(instancer, name, value)
+
+
+CONFIG = {
+    "CHALLENGE_IMAGE": IMAGE,
+    "CONTAINER_PREFIX": PREFIX,
+    "NETWORK_PREFIX": NET_PREFIX,
+    "MODE": "netcat",
+    "INSTANCE_PORT_MIN": PORT_MIN,
+    "INSTANCE_PORT_MAX": PORT_MAX,
+    "SUBNET_POOL": ipaddress.ip_network(SUBNET_POOL),
+    "SUBNET_PREFIX": 24,
+    "PROXY_CONTAINER": PROXY_NAME,
+    "PROXY_TOKEN": TOKEN,
+    "PROXY_PORT": PROXY_HOST_PORT,
+}
+
+
+def start_proxy(client, instancer_url):
+    """The proxy container, on the address it will bind and nothing else."""
+    endpoint = client.api.create_endpoint_config(ipv4_address=PROXY_IP)
+    container = client.api.create_container(
+        PROXY_IMAGE, name=PROXY_NAME, ports=[PROXY_PORT],
+        environment={
+            "PROXY_BIND": PROXY_IP,
+            "PROXY_PORT": str(PROXY_PORT),
+            "PROXY_TOKEN": TOKEN,
+            "INSTANCER_URL": instancer_url,
+            "MODE": "netcat",
+        },
+        host_config=client.api.create_host_config(
+            port_bindings={PROXY_PORT: ("127.0.0.1", PROXY_HOST_PORT)}),
+        networking_config=client.api.create_networking_config(
+            {CONTROL_NET: endpoint}))
+    client.api.start(container)
+    return client.containers.get(PROXY_NAME)
+
+
+@pytest.fixture
+def web(world):
+    """A player's browser."""
+    client = instancer.app.test_client()
+    client.get("/")
+    return client
 
 
 @pytest.fixture(autouse=True)
-def clean_slate(real_client):
-    remove_leftovers(real_client)
+def clean_slate(world):
+    yield
+    remove_instances(instancer.client())
 
 
 def remove_leftovers(client):
+    for name in (PROXY_NAME,):
+        try:
+            client.containers.get(name).remove(force=True)
+        except docker.errors.NotFound:
+            pass
+    remove_instances(client)
+    for network in client.networks.list():
+        if network.name == CONTROL_NET:
+            network.remove()
+
+
+def remove_instances(client):
     for container in client.containers.list(all=True):
         if container.name.startswith(PREFIX):
             container.remove(force=True)
     for network in client.networks.list():
-        if network.name.startswith(NET_PREFIX):
-            network.remove()
+        if not network.name.startswith(NET_PREFIX):
+            continue
+        network.reload()
+        for endpoint in (network.attrs.get("Containers") or {}):
+            network.disconnect(endpoint, force=True)
+        network.remove()
 
 
 def instances(client):
@@ -56,38 +167,24 @@ def instances(client):
 
 
 def networks(client):
-    return [n for n in client.networks.list() if n.name.startswith(NET_PREFIX)]
+    # list() answers with a summary; only inspect knows who is attached.
+    found = [n for n in client.networks.list() if n.name.startswith(NET_PREFIX)]
+    for network in found:
+        network.reload()
+    return found
 
 
-def configure(module, monkeypatch):
-    monkeypatch.setattr(module, "CHALLENGE_IMAGE", IMAGE)
-    monkeypatch.setattr(module, "CONTAINER_PREFIX", PREFIX)
-    monkeypatch.setattr(module, "NETWORK_PREFIX", NET_PREFIX)
-    monkeypatch.setattr(module, "CONTAINER_PORT", 41240)
-    monkeypatch.setattr(module, "MODE", "netcat")
-    monkeypatch.setattr(module, "PORT_MIN", PORT_MIN)
-    monkeypatch.setattr(module, "PORT_MAX", PORT_MAX)
-    monkeypatch.setattr(module.app, "secret_key", SECRET)
-    client = module.app.test_client()
-    client.get("/")
-    return client
+# --- talking to the proxy -----------------------------------------------------
 
-
-def load_fresh_module():
-    spec = importlib.util.spec_from_file_location("app_restarted", REPO / "instancer-core" / "app.py")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def fetch_over_tcp(port, timeout=15):
-    """Connect to the pwn service and read its banner, waiting for it to boot."""
+def play(key, timeout=20):
+    """Do what a player does: connect to the proxy, hand over the key, read."""
     deadline = time.time() + timeout
     while True:
         try:
-            with socket.create_connection(("127.0.0.1", port), timeout=2) as sock:
-                sock.sendall(b"0 0\n")
+            with socket.create_connection(("127.0.0.1", PROXY_HOST_PORT), timeout=3) as sock:
                 sock.settimeout(3)
+                sock.recv(4096)                     # the key prompt
+                sock.sendall(key.encode() + b"\n")
                 data = b""
                 while len(data) < 32:
                     chunk = sock.recv(4096)
@@ -99,126 +196,169 @@ def fetch_over_tcp(port, timeout=15):
         except OSError:
             pass
         if time.time() > deadline:
-            raise AssertionError("challenge never answered on port %d" % port)
+            raise AssertionError("nothing came back through the proxy")
         time.sleep(0.3)
 
 
-def bridge_reachable(container):
-    for network in container.attrs["NetworkSettings"]["Networks"].values():
-        ip = network.get("IPAddress")
-        if not ip:
-            continue
-        try:
-            socket.create_connection((ip, 41240), timeout=3).close()
-            return True
-        except OSError:
-            continue
-    return False
+def can_reach(container, host, port, shell="bash"):
+    """Whether a container can open a TCP connection -- from inside it."""
+    code, _ = container.exec_run(
+        [shell, "-c", "timeout 2 %s -c 'exec 3<>/dev/tcp/%s/%d'" % (shell, host, port)])
+    return code == 0
 
 
-def test_lifecycle(real_client, monkeypatch):
-    web = configure(instancer, monkeypatch)
+def dial_from(container, host, port, timeout=15):
+    """Try to connect from inside a container, retrying while it boots."""
+    deadline = time.time() + timeout
+    while True:
+        code, _ = container.exec_run(
+            ["python", "-c",
+             "import socket; socket.create_connection((%r, %d), 3)" % (host, port)])
+        if code == 0 or time.time() > deadline:
+            return code == 0
+        time.sleep(0.3)
 
-    assert web.post("/destroy").get_json() == {"running": False, "mode": "netcat"}
+
+def default_routes(container):
+    """The instance's default routes, read from inside it (destination 0.0.0.0)."""
+    routes = container.exec_run(["cat", "/proc/net/route"]).output.decode()
+    return [line for line in routes.splitlines()[1:] if line.split()[1] == "00000000"]
+
+
+def address_on(container, network_name):
+    container.reload()
+    return container.attrs["NetworkSettings"]["Networks"][network_name]["IPAddress"]
+
+
+# --- lifecycle ----------------------------------------------------------------
+
+def test_lifecycle(web, world):
+    client = instancer.client()
+    assert web.post("/destroy").get_json()["running"] is False
 
     created = web.post("/create", json={"ttl": 120}).get_json()
     assert created["running"] is True
     assert PORT_MIN <= created["port"] <= PORT_MAX
     assert created["mode"] == "netcat"
+    assert created["proxy_port"] == PROXY_HOST_PORT
     assert 0 < created["remaining_time"] <= 120
-    port = created["port"]
 
-    # the container runs on its own network, mapped to the advertised host port
-    container = instances(real_client)[0]
+    container = instances(client)[0]
     assert container.status == "running"
     owner = container.labels["ctf.owner"]
-    assert container.labels["ctf.expires_at"].isdigit()
+    assert container.labels["ctf.key"] == created["key"]
+    assert container.labels["ctf.port"] == str(created["port"])
 
-    net = networks(real_client)[0]
+    # nothing of the instance is published: the proxy is the only way in
+    assert not (container.attrs["NetworkSettings"]["Ports"] or {})
+
+    net = networks(client)[0]
     assert net.name == instancer.NETWORK_PREFIX + owner
+    assert net.attrs["Internal"] is True
     subnet = net.attrs["IPAM"]["Config"][0]["Subnet"]
-    assert subnet.startswith("10.100.")
+    assert subnet.startswith("10.241.")
     assert container.labels["ctf.subnet"] == subnet
 
-    bindings = container.attrs["NetworkSettings"]["Ports"]["41240/tcp"]
-    assert str(port) in [b["HostPort"] for b in bindings]
-
-    # a restarted process adopts the same container + reads its TTL from labels
-    restarted = load_fresh_module()
-    restarted_web = configure(restarted, monkeypatch)
-    restarted_web.set_cookie("session", web.get_cookie("session").value)
-    adopted = restarted_web.get("/status").get_json()
-    assert adopted["port"] == port
-    assert adopted["expires_at"] == created["expires_at"]
-    assert len(instances(real_client)) == 1
+    # ...and the proxy is on that network, so it can dial in
+    assert PROXY_NAME in {c["Name"] for c in net.attrs["Containers"].values()}
 
     # a second create does not start a second container/network
-    assert web.post("/create").get_json()["port"] == port
-    assert len(instances(real_client)) == 1
-    assert len(networks(real_client)) == 1
+    assert web.post("/create").get_json()["key"] == created["key"]
+    assert len(instances(client)) == 1
+    assert len(networks(client)) == 1
 
-    # destroy removes both container and network
-    assert web.post("/destroy").get_json() == {"running": False, "mode": "netcat"}
-    assert instances(real_client) == []
-    assert networks(real_client) == []
-    assert web.post("/destroy").get_json() == {"running": False, "mode": "netcat"}
+    assert web.post("/destroy").get_json()["running"] is False
+    assert instances(client) == []
+    assert networks(client) == []          # the proxy was detached first
 
 
-def test_two_sessions_get_two_networks(real_client, monkeypatch):
-    a = configure(instancer, monkeypatch)
-    b = instancer.app.test_client()
-    b.get("/")
-
-    pa = a.post("/create").get_json()["port"]
-    pb = b.post("/create").get_json()["port"]
-    try:
-        assert pa != pb
-        assert len(instances(real_client)) == 2
-        assert len(networks(real_client)) == 2
-        subnets = {n.attrs["IPAM"]["Config"][0]["Subnet"] for n in networks(real_client)}
-        assert len(subnets) == 2
-    finally:
-        a.post("/destroy")
-        b.post("/destroy")
-    assert networks(real_client) == []
+def test_the_key_gets_a_player_through_the_proxy(web, world):
+    key = web.post("/create").get_json()["key"]
+    assert "Special gifts" in play(key)
 
 
-def test_reaper_destroys_expired_instance(real_client, monkeypatch):
-    web = configure(instancer, monkeypatch)
+def test_another_key_gets_nobody_anywhere(web, world):
+    web.post("/create").get_json()
+    with socket.create_connection(("127.0.0.1", PROXY_HOST_PORT), timeout=5) as sock:
+        sock.settimeout(5)
+        sock.recv(4096)
+        sock.sendall(b"f" * 32 + b"\n")
+        assert b"no instance" in sock.recv(4096)
+
+
+def test_a_destroyed_instances_key_stops_working(web, world):
+    key = web.post("/create").get_json()["key"]
+    play(key)                                # it worked a moment ago
+    web.post("/destroy")
+    with socket.create_connection(("127.0.0.1", PROXY_HOST_PORT), timeout=5) as sock:
+        sock.settimeout(5)
+        sock.recv(4096)
+        sock.sendall(key.encode() + b"\n")
+        assert b"no instance" in sock.recv(4096)
+
+
+# --- isolation ----------------------------------------------------------------
+
+def test_an_instance_can_reach_nothing_but_its_own_subnet(web, world):
+    client = instancer.client()
+    web.post("/create")
+    instance = instances(client)[0]
+    network = networks(client)[0].name
+
+    # The proxy is on the instance's network -- and answers on none of it.
+    proxy_here = address_on(world, network)
+    assert not can_reach(instance, proxy_here, PROXY_PORT)
+
+    # The control network, where the proxy and the instancer actually live.
+    assert not can_reach(instance, PROXY_IP, PROXY_PORT)
+
+    # And the host: an instance with no gateway has no route off its own /24.
+    assert default_routes(instance) == []
+
+
+def test_the_proxy_can_reach_the_instance(web, world):
+    created = web.post("/create").get_json()
+    client = instancer.client()
+    instance = instances(client)[0]
+    network = networks(client)[0].name
+    assert dial_from(world, address_on(instance, network), created["port"])
+
+
+def test_two_sessions_are_strangers(web, world):
+    client = instancer.client()
+    other = instancer.app.test_client()
+    other.get("/")
+
+    mine = web.post("/create").get_json()
+    theirs = other.post("/create").get_json()
+    assert mine["key"] != theirs["key"]
+    assert mine["port"] != theirs["port"]
+    assert len(instances(client)) == 2
+    assert len({n.attrs["IPAM"]["Config"][0]["Subnet"] for n in networks(client)}) == 2
+
+    # neither instance's network can carry a packet to the other
+    a, b = instances(client)
+    net_a = instancer.network_name(a.labels["ctf.owner"])
+    assert not can_reach(b, address_on(a, net_a), int(a.labels["ctf.port"]))
+
+
+# --- reaping and failure ------------------------------------------------------
+
+def test_reaper_destroys_expired_instance(web, world):
+    client = instancer.client()
     web.post("/create", json={"ttl": 1})
-    assert len(instances(real_client)) == 1
+    assert len(instances(client)) == 1
     time.sleep(2)
     instancer.reap_expired()
-    assert instances(real_client) == []
-    assert networks(real_client) == []
+    assert instances(client) == []
+    assert networks(client) == []
 
 
-def test_challenge_answers_over_netcat(real_client, monkeypatch):
-    """The published host port must actually serve the pwn binary.
-
-    Some hosts block host<->docker-bridge traffic; there the port mapping is all
-    the instancer can be held responsible for, so we skip loudly instead of
-    reporting a false pass.
-    """
-    web = configure(instancer, monkeypatch)
-    port = web.post("/create").get_json()["port"]
-    try:
-        try:
-            banner = fetch_over_tcp(port, timeout=10)
-        except AssertionError:
-            if bridge_reachable(instances(real_client)[0]):
-                raise
-            pytest.skip("host cannot reach docker container networking (port mapping verified instead)")
-        assert "Special gifts" in banner
-    finally:
-        web.post("/destroy")
-
-
-def test_create_fails_cleanly_on_bad_image(real_client, monkeypatch):
-    web = configure(instancer, monkeypatch)
+def test_create_fails_cleanly_on_bad_image(web, world, monkeypatch):
+    client = instancer.client()
     monkeypatch.setattr(instancer, "CHALLENGE_IMAGE", "ctf-challenge:does-not-exist")
     response = web.post("/create")
     assert response.status_code == 500
     assert response.get_json()["running"] is False
-    assert instances(real_client) == []
-    assert networks(real_client) == []   # network rolled back
+    assert instances(client) == []
+    assert networks(client) == []          # network rolled back, proxy detached

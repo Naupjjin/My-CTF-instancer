@@ -2,6 +2,7 @@
 
 import ipaddress
 import re
+import signal
 import threading
 import time
 
@@ -626,6 +627,40 @@ def test_reaper_keeps_network_with_container(web, daemon):
     web.post("/create")
     instancer.prune_orphan_networks()
     assert len(daemon.networks) == 1
+
+
+# --- shutdown -----------------------------------------------------------------
+
+def test_destroy_all_takes_every_instance(web, other, daemon):
+    web.post("/create")
+    other.post("/create")
+    assert len(daemon.containers) == 2
+    instancer.destroy_all()
+    assert daemon.containers == {}
+    assert daemon.networks == {}
+
+
+def test_shutdown_destroys_what_compose_cannot_see(web, daemon):
+    web.post("/create")
+    with pytest.raises(SystemExit):
+        instancer.handle_shutdown(signal.SIGTERM, None)
+    assert daemon.containers == {}
+    assert daemon.networks == {}
+
+
+def test_shutdown_can_be_told_to_leave_instances_running(web, daemon, monkeypatch):
+    monkeypatch.setattr(instancer, "REAP_ON_SHUTDOWN", False)
+    web.post("/create")
+    with pytest.raises(SystemExit):
+        instancer.handle_shutdown(signal.SIGTERM, None)
+    assert len(daemon.containers) == 1     # adopted again on the way back up
+
+
+def test_shutdown_exits_even_when_cleanup_fails(web, daemon, monkeypatch):
+    monkeypatch.setattr(instancer, "destroy_all",
+                        lambda: (_ for _ in ()).throw(RuntimeError("docker is gone")))
+    with pytest.raises(SystemExit):
+        instancer.handle_shutdown(signal.SIGTERM, None)
 
 
 # --- mode ---------------------------------------------------------------------

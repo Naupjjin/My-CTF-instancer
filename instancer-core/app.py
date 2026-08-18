@@ -19,6 +19,8 @@ import ipaddress
 import logging
 import os
 import secrets
+import signal
+import sys
 import threading
 import time
 
@@ -70,6 +72,18 @@ SUBNET_PREFIX = int(os.environ.get("SUBNET_PREFIX", "24"))
 # network, which still blocks routing but leaves the gateway address reachable.
 GATEWAY_MODE_OPTION = "com.docker.network.bridge.gateway_mode_ipv4"
 NETWORK_OPTIONS = {GATEWAY_MODE_OPTION: "isolated"}
+
+# Instances outlive this process by design -- a crash, or a restart mid-event,
+# must not take every player's instance with it (they are re-adopted from their
+# labels on the way back up). A clean shutdown is the other case: `docker
+# compose down` means "take it all down", and compose knows nothing about
+# containers we created, so we have to. Set 0 to keep instances across a
+# deliberate stop as well.
+REAP_ON_SHUTDOWN = os.environ.get("REAP_ON_SHUTDOWN", "1").lower() not in ("0", "false", "no")
+
+# How long a shutdown waits for an in-flight create before tearing down anyway.
+# Docker's own grace period is short; being late is worse than being rude.
+SHUTDOWN_LOCK_WAIT = 5
 
 # TTL: how long an instance lives, and how often the reaper looks.
 DEFAULT_TTL = int(os.environ.get("DEFAULT_TTL", "3600"))
@@ -530,6 +544,36 @@ def prune_orphan_networks():
                 log.error("could not remove orphan network %s: %s", network.name, exc)
 
 
+def destroy_all():
+    """Tear down every instance there is. The end of the line for a shutdown."""
+    held = lock.acquire(timeout=SHUTDOWN_LOCK_WAIT)
+    try:
+        for container in list_instances():
+            owner = instance_owner(container)
+            log.info("shutting down: destroying instance of %s", owner)
+            remove_instance(owner)
+        prune_orphan_networks()
+    finally:
+        if held:
+            lock.release()
+
+
+def handle_shutdown(signum, frame):
+    """SIGTERM/SIGINT: what `docker compose down` and Ctrl-C arrive as."""
+    log.info("signal %d received, shutting down", signum)
+    if REAP_ON_SHUTDOWN:
+        try:
+            destroy_all()
+        except Exception as exc:   # a failed cleanup must not block the exit
+            log.error("shutdown cleanup failed: %s", exc)
+    sys.exit(0)
+
+
+def install_shutdown_handler():
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(signum, handle_shutdown)
+
+
 def cleanup_loop():
     while True:
         time.sleep(CLEANUP_INTERVAL)
@@ -559,12 +603,14 @@ def startup():
         log.info("adopted instance of %s (%s), expires_at=%s", instance_owner(container),
                  container.status, instance_expires_at(container))
     log.info("server started on port %d (mode=%s, proxy %s:%d via %s, instance ports "
-             "%d-%d, subnet pool %s /%d, default ttl %ds)",
+             "%d-%d, subnet pool %s /%d, default ttl %ds, reap on shutdown: %s)",
              LISTEN_PORT, MODE, PROXY_HOST or "<this host>", PROXY_PORT, PROXY_CONTAINER,
-             INSTANCE_PORT_MIN, INSTANCE_PORT_MAX, SUBNET_POOL, SUBNET_PREFIX, DEFAULT_TTL)
+             INSTANCE_PORT_MIN, INSTANCE_PORT_MAX, SUBNET_POOL, SUBNET_PREFIX, DEFAULT_TTL,
+             "yes" if REAP_ON_SHUTDOWN else "no")
 
 
 if __name__ == "__main__":
     startup()
+    install_shutdown_handler()
     start_cleanup_thread()
     app.run(host="0.0.0.0", port=LISTEN_PORT)

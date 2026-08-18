@@ -367,6 +367,15 @@ def test_reaper_destroys_expired_instance(web, world):
     assert networks(client) == []
 
 
+def test_shutdown_takes_the_instances_with_it(web, world):
+    client = instancer.client()
+    web.post("/create")
+    assert len(instances(client)) == 1
+    instancer.destroy_all()
+    assert instances(client) == []
+    assert networks(client) == []     # the proxy was detached from each of them
+
+
 def test_create_fails_cleanly_on_bad_image(web, world, monkeypatch):
     client = instancer.client()
     monkeypatch.setattr(instancer, "CHALLENGE_IMAGE", "spawnzero-challenge:does-not-exist")

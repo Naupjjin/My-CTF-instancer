@@ -65,27 +65,34 @@ PROXY_BIND=127.0.0.1 PROXY_TOKEN=... python proxy-core/proxy.py
 
 ## Cleaning up
 
-`docker compose down` removes the instancer, the proxy and the control network —
-but **not the instances**. They are created by the instancer at runtime, not by
-compose, so compose does not know about them. That is deliberate: a
-`docker compose restart`, or the instancer crashing, must not take every player's
-instance with it (it re-adopts them from their labels on the way back up).
-
-To actually remove everything, take the stack down first — that frees the proxy's
-endpoint on each instance network — and then clear the instances by label:
-
 ```sh
 docker compose down
+```
+
+takes the instances with it. Compose does not know about them — the instancer
+creates them at runtime over the Docker socket — so the instancer destroys them
+itself when it is asked to stop, along with their networks. `depends_on` puts it
+ahead of the proxy in the stop order, so the proxy is still around to be detached
+from each instance network on the way out, and `stop_grace_period: 60s` gives a
+full house time to come down.
+
+A *crash* is the other case, and there it deliberately does not happen: instances
+survive, and a restarted instancer re-adopts them from their labels instead of
+leaving players stranded. `REAP_ON_SHUTDOWN=0` extends that to deliberate stops
+too — worth setting mid-event if you want `docker compose restart` to be a
+non-event for players.
+
+If instances ever do outlive their instancer (it was killed, or the daemon
+restarted under it), they are labelled, so clearing them is exact:
+
+```sh
 docker rm -f $(docker ps -aq --filter label=spawnzero.owner) 2>/dev/null
 docker network rm $(docker network ls -q --filter label=spawnzero.owner) 2>/dev/null
 ```
 
-Left alone, instances go away on their own within `DEFAULT_TTL` — but only while
-an instancer is running to reap them.
-
-If a network refuses to go with `has active endpoints`, the proxy is still
-attached: remove the proxy container first, or
-`docker network disconnect -f <network> spawnzero-proxy`.
+Take the stack down first: a network with the proxy still attached refuses to go
+with `has active endpoints`. Left alone, instances expire within `DEFAULT_TTL`
+anyway — but only while an instancer is running to reap them.
 
 ## Configuration
 
@@ -107,6 +114,7 @@ Everything is environment variables (defaults in brackets). The instancer:
 | `DEFAULT_TTL` | `3600` | instance lifetime in seconds when `/create` gives no `ttl` |
 | `MAX_TTL` | `86400` | ceiling a requested `ttl` is clamped to |
 | `CLEANUP_INTERVAL` | `10` | how often the background reaper checks for expiry (seconds) |
+| `REAP_ON_SHUTDOWN` | `1` | destroy every instance when the instancer is asked to stop; `0` leaves them for the next start to adopt |
 | `LISTEN_PORT` | `5000` | port of the instancer web UI |
 | `SECRET_KEY` | random | signs the session cookies that carry instance ownership |
 | `PROXY_CONTAINER` | `spawnzero-proxy` | container the instancer attaches to every instance network |

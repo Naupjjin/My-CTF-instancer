@@ -25,6 +25,7 @@ import threading
 import time
 
 import docker
+import yaml
 from docker.errors import APIError, DockerException, ImageNotFound, NotFound
 from flask import Flask, jsonify, render_template, request, session
 
@@ -56,6 +57,9 @@ KEY_BYTES = int(os.environ.get("KEY_BYTES", "16"))
 
 # The environment variable that tells the challenge which port to listen on.
 PORT_ENV = os.environ.get("PORT_ENV", "CHAL_PORT")
+
+# The one thing that is not an environment variable: the names on the page.
+CONFIG_FILE = os.environ.get("CONFIG_FILE", "config.yml")
 
 # Blast radius of one instance. Empty or 0 leaves the limit to Docker.
 MEM_LIMIT = os.environ.get("MEM_LIMIT", "512m")
@@ -114,6 +118,49 @@ if MODE not in ("http", "netcat"):
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("instancer")
+
+
+# --- names --------------------------------------------------------------------
+
+DEFAULT_CONFIG = {
+    "chal_name": "challenge",
+    "author": "",
+    "type": "",
+    "instancer_name": "SpawnZero",
+}
+
+
+def load_config(path=None):
+    """Read config.yml. Names only -- nothing here changes how anything runs.
+
+    A missing or broken file is not fatal: an instancer that will not start
+    because someone fat-fingered a display name would be a worse trade than one
+    that starts with a placeholder on the page and a complaint in the log.
+    """
+    path = path or CONFIG_FILE
+    try:
+        with open(path) as handle:
+            loaded = yaml.safe_load(handle) or {}
+    except OSError as exc:
+        log.warning("no config file at %s (%s), falling back to defaults", path, exc)
+        return dict(DEFAULT_CONFIG)
+    except yaml.YAMLError as exc:
+        log.error("config file %s is not valid YAML (%s), falling back to defaults",
+                  path, exc)
+        return dict(DEFAULT_CONFIG)
+    if not isinstance(loaded, dict):
+        log.error("config file %s is not a mapping, falling back to defaults", path)
+        return dict(DEFAULT_CONFIG)
+    unknown = set(loaded) - set(DEFAULT_CONFIG)
+    if unknown:
+        log.warning("ignoring unknown key(s) in %s: %s", path, ", ".join(sorted(unknown)))
+    config = dict(DEFAULT_CONFIG)
+    config.update({key: str(loaded[key]) for key in DEFAULT_CONFIG
+                   if loaded.get(key) is not None})
+    return config
+
+
+CONFIG = load_config()
 
 app = Flask(__name__)
 app.secret_key = SECRET_KEY or secrets.token_hex(32)
@@ -428,7 +475,7 @@ def index():
     # into two identities (and therefore two containers).
     owner_id()
     return render_template("index.html", mode=MODE, default_ttl=DEFAULT_TTL,
-                           proxy_host=PROXY_HOST, proxy_port=PROXY_PORT)
+                           proxy_host=PROXY_HOST, proxy_port=PROXY_PORT, **CONFIG)
 
 
 @app.get("/status")
@@ -602,6 +649,8 @@ def startup():
     for container in list_instances():
         log.info("adopted instance of %s (%s), expires_at=%s", instance_owner(container),
                  container.status, instance_expires_at(container))
+    log.info("%s serving %r by %s (%s)", CONFIG["instancer_name"], CONFIG["chal_name"],
+             CONFIG["author"] or "nobody in particular", CONFIG["type"] or "no type")
     log.info("server started on port %d (mode=%s, proxy %s:%d via %s, instance ports "
              "%d-%d, subnet pool %s /%d, default ttl %ds, reap on shutdown: %s)",
              LISTEN_PORT, MODE, PROXY_HOST or "<this host>", PROXY_PORT, PROXY_CONTAINER,

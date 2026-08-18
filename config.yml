@@ -1,0 +1,11 @@
+# Names. Everything operational lives in docker-compose.yml as environment
+# variables; this file is only what gets *written* on the page.
+
+# The challenge, as players see it.
+chal_name: Special Love
+author: naup
+type: pwn
+
+# This deployment, as it introduces itself -- on the page and in the log when
+# the instancer comes up.
+instancer_name: SpawnZero

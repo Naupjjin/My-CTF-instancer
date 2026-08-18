@@ -17,6 +17,7 @@ services:
       control:
     volumes:
       - ./challenge:/challenge:ro
+      - ./config.yml:/config.yml:ro
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
       # Keep this stable (e.g. in a .env file): it signs the session cookies
@@ -31,6 +32,7 @@ services:
       # this page (a second host, a DNS name). Empty = same host as the UI.
       PROXY_HOST: ${PROXY_HOST:-}
       LISTEN_PORT: ${LISTEN_PORT:-5000}
+      CONFIG_FILE: /config.yml
       CHALLENGE_DIR: /challenge
       CHALLENGE_IMAGE: spawnzero-challenge:latest
       # The challenge image is built once, only if missing, so startup is instant

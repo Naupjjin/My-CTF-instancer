@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>SPAWNZERO</title>
+<title>{{ chal_name }} // {{ instancer_name }}</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&family=VT323&display=swap" rel="stylesheet">
@@ -82,7 +82,9 @@
   #console { opacity: 0; transition: opacity .25s steps(4); }
   #console.on { opacity: 1; }
 
-  h1.pixel { font-size: 19px; margin: 2px 0 20px; color: var(--ink); letter-spacing: 1px; }
+  h1.pixel { font-size: 19px; margin: 2px 0 7px; color: var(--ink); letter-spacing: 1px; }
+  .sub { margin: 0 0 20px; }
+  .sub .tag { color: var(--accent); text-transform: uppercase; letter-spacing: 1px; }
 
   .row { display: flex; align-items: baseline; gap: 12px; margin: 9px 0; flex-wrap: wrap; }
   .lbl { color: var(--accent); font-size: 11px; min-width: 92px; }
@@ -149,7 +151,7 @@
 <body>
 <div id="frame">
   <div id="titlebar">
-    <span class="brand pixel glitch" data-text="SPAWN//ZERO">SPAWN//ZERO</span>
+    <span class="brand pixel glitch" data-text="{{ instancer_name|upper }}">{{ instancer_name|upper }}</span>
     <span class="dots"><i class="s"></i><i class="a"></i><i class="r"></i></span>
   </div>
 
@@ -157,7 +159,14 @@
     <div id="boot"></div>
 
     <div id="console">
-      <h1 class="pixel">SPAWNZERO</h1>
+      <h1 class="pixel">{{ chal_name|upper }}</h1>
+      {% if type or author %}
+      <div class="sub muted">
+        {%- if type %}<span class="tag">{{ type }}</span>{% endif -%}
+        {%- if type and author %} // {% endif -%}
+        {%- if author %}by {{ author }}{% endif -%}
+      </div>
+      {% endif %}
 
       <div class="row">
         <span class="lbl pixel">STATUS</span>
@@ -203,6 +212,7 @@
 <script>
 // Injected by Flask. TTL lifetime and the proxy address are decided by the
 // server (docker-compose); an empty PROXY_HOST means "the host serving this page".
+const INSTANCER_NAME = {{ instancer_name|tojson }};
 const MODE = {{ mode|tojson }};
 const DEFAULT_TTL = {{ default_ttl }};
 const PROXY_HOST = {{ proxy_host|tojson }};
@@ -230,7 +240,7 @@ let countdown = null;
 
 /* ---------- boot sequence (typewriter, runs once) ---------- */
 const BOOT_LINES = [
-  "SPAWNZERO 1.0  spawn systems (c) 199X",
+  INSTANCER_NAME.toUpperCase() + " 1.0  spawn systems (c) 199X",
   "MEM CHECK ........ 640K OK",
   "LINK ............. <b>ONLINE</b>",
   "READY.",

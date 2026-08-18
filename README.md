@@ -96,7 +96,29 @@ anyway — but only while an instancer is running to reap them.
 
 ## Configuration
 
-Everything is environment variables (defaults in brackets). The instancer:
+### Names — `config.yml`
+
+The one thing that is not an environment variable, because it is written rather
+than configured: what the page says.
+
+```yaml
+chal_name: Special Love
+author: naup
+type: pwn
+
+instancer_name: SpawnZero
+```
+
+`chal_name` is the heading, with `type` and `author` under it; `instancer_name`
+is the titlebar, the boot banner, and the first line the instancer logs on
+startup. Nothing here changes how anything runs — a missing key falls back to a
+default, and a missing or broken file leaves the instancer running with
+placeholders and a complaint in the log rather than refusing to start. Unknown
+keys are ignored out loud. Point `CONFIG_FILE` elsewhere to use another path.
+
+### Everything else — environment variables
+
+Defaults in brackets. The instancer:
 
 | Variable | Default | Meaning |
 | --- | --- | --- |

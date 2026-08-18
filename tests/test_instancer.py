@@ -236,7 +236,6 @@ def lookup(web, key, token=TOKEN):
 
 def test_index_serves_ui(web):
     body = web.get("/").get_data(as_text=True)
-    assert "SPAWNZERO" in body
     assert "START" in body
     assert "STOP" in body
 
@@ -251,6 +250,81 @@ def test_session_comes_from_the_page_not_from_polling(daemon):
     assert client.get_cookie("session") is None
     client.get("/")
     assert client.get_cookie("session") is not None
+
+
+# --- names (config.yml) -------------------------------------------------------
+
+NAMES = {"chal_name": "Special Love", "author": "naup", "type": "pwn",
+         "instancer_name": "SpawnZero"}
+
+
+@pytest.fixture
+def named(monkeypatch):
+    monkeypatch.setattr(instancer, "CONFIG", dict(NAMES))
+
+
+def write_config(tmp_path, text):
+    path = tmp_path / "config.yml"
+    path.write_text(text)
+    return str(path)
+
+
+def test_config_is_read_from_the_file(tmp_path):
+    path = write_config(tmp_path, "chal_name: Ret2Win\nauthor: someone\n"
+                                  "type: pwn\ninstancer_name: Zero\n")
+    assert instancer.load_config(path) == {
+        "chal_name": "Ret2Win", "author": "someone",
+        "type": "pwn", "instancer_name": "Zero"}
+
+
+def test_config_fills_in_what_the_file_leaves_out(tmp_path):
+    config = instancer.load_config(write_config(tmp_path, "chal_name: Ret2Win\n"))
+    assert config["chal_name"] == "Ret2Win"
+    assert config["instancer_name"] == instancer.DEFAULT_CONFIG["instancer_name"]
+    assert config["author"] == ""
+
+
+def test_config_values_are_always_strings(tmp_path):
+    # `chal_name: 1337` is a number to YAML and a name to everyone else.
+    assert instancer.load_config(write_config(tmp_path, "chal_name: 1337\n"))["chal_name"] == "1337"
+
+
+def test_a_missing_config_does_not_stop_the_instancer(tmp_path, caplog):
+    assert instancer.load_config(str(tmp_path / "nope.yml")) == instancer.DEFAULT_CONFIG
+    assert "falling back to defaults" in caplog.text
+
+
+def test_a_broken_config_does_not_stop_the_instancer(tmp_path, caplog):
+    path = write_config(tmp_path, "chal_name: [unclosed\n")
+    assert instancer.load_config(path) == instancer.DEFAULT_CONFIG
+    assert "not valid YAML" in caplog.text
+
+
+def test_a_config_that_is_not_a_mapping_does_not_stop_the_instancer(tmp_path, caplog):
+    assert instancer.load_config(write_config(tmp_path, "- pwn\n")) == instancer.DEFAULT_CONFIG
+    assert "not a mapping" in caplog.text
+
+
+def test_unknown_config_keys_are_ignored_out_loud(tmp_path, caplog):
+    path = write_config(tmp_path, "chal_name: Ret2Win\nflag: AIS3{...}\n")
+    assert "flag" not in instancer.load_config(path)
+    assert "ignoring unknown key(s)" in caplog.text
+
+
+def test_the_page_shows_the_configured_names(web, named):
+    body = web.get("/").get_data(as_text=True)
+    assert "SPECIAL LOVE" in body        # the challenge is the heading
+    assert "by naup" in body
+    assert ">pwn<" in body
+    assert "SPAWNZERO" in body           # the instancer is the chrome
+
+
+def test_the_page_leaves_out_an_author_and_type_nobody_gave(web, daemon, monkeypatch):
+    monkeypatch.setattr(instancer, "CONFIG",
+                        dict(NAMES, author="", type=""))
+    body = web.get("/").get_data(as_text=True)
+    assert "SPECIAL LOVE" in body
+    assert 'class="sub' not in body      # no empty "by  // " line
 
 
 # --- create / status / destroy ------------------------------------------------

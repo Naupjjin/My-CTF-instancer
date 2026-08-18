@@ -1,0 +1,8 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+COPY instancer-core/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY instancer-core/ .
+
+CMD ["python", "app.py"]

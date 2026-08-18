@@ -1,0 +1,8 @@
+services:
+  pwn-special-love:
+    build: ./
+    volumes:
+      - ./share:/home/chal:ro
+      - ./xinetd:/etc/xinetd.d/chal:ro
+    ports:
+      - 41240:41240

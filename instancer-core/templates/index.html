@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>CTF Instancer</title>
+<style>
+  body { font-family: sans-serif; margin: 3rem auto; max-width: 30rem; }
+  #address { font-family: monospace; }
+  button { padding: .5rem 1rem; font-size: 1rem; }
+  .hint { color: #666; font-size: .9rem; }
+  .error { color: #b00; }
+</style>
+</head>
+<body>
+<h1>CTF Instancer</h1>
+<p class="hint">Every browser session gets its own instance.</p>
+
+<p>Status:<br><span id="state">loading...</span></p>
+<p id="address-line" hidden>Address:<br><a id="address"></a></p>
+
+<button id="start" hidden>Start Instance</button>
+<button id="stop" hidden>Stop Instance</button>
+
+<p id="error" class="error"></p>
+
+<script>
+const state = document.getElementById("state");
+const addressLine = document.getElementById("address-line");
+const address = document.getElementById("address");
+const start = document.getElementById("start");
+const stop = document.getElementById("stop");
+const error = document.getElementById("error");
+
+function render(data) {
+  if (data.running) {
+    const url = "http://" + location.hostname + ":" + data.port;
+    state.textContent = "Instance running";
+    address.textContent = url;
+    address.href = url;
+    addressLine.hidden = false;
+    start.hidden = true;
+    stop.hidden = false;
+  } else {
+    state.textContent = "Instance not running";
+    addressLine.hidden = true;
+    start.hidden = false;
+    stop.hidden = true;
+  }
+}
+
+async function call(path, method) {
+  start.disabled = stop.disabled = true;
+  error.textContent = "";
+  try {
+    const response = await fetch(path, { method: method });
+    const data = await response.json();
+    if (data.error) { error.textContent = data.error; }
+    render(data);
+  } catch (e) {
+    error.textContent = e;
+  }
+  start.disabled = stop.disabled = false;
+}
+
+start.onclick = () => call("/create", "POST");
+stop.onclick = () => call("/destroy", "POST");
+call("/status", "GET");
+</script>
+</body>
+</html>

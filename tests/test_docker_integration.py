@@ -17,21 +17,20 @@ from werkzeug.serving import make_server
 import app as instancer
 
 REPO = Path(__file__).resolve().parents[1]
-IMAGE = "ctf-challenge:test"
-PROXY_IMAGE = "ctf-proxy:test"
-PREFIX = "ctf-instance-test-"
-NET_PREFIX = "ctf-network-test-"
+IMAGE = "spawnzero-challenge:test"
+PROXY_IMAGE = "spawnzero-proxy:test"
+PREFIX = "spawnzero-instance-test-"
+NET_PREFIX = "spawnzero-network-test-"
 SECRET = "integration-test-secret"
 TOKEN = "integration-test-token"
 
 # The proxy's own turf: one network shared with the instancer, one fixed address
 # it binds, one published port players arrive on.
-CONTROL_NET = "ctf-control-test"
+CONTROL_NET = "spawnzero-control-test"
 CONTROL_SUBNET = "10.239.9.0/24"
-PROXY_NAME = "ctf-proxy-test"
+PROXY_NAME = "spawnzero-proxy-test"
 PROXY_IP = "10.239.9.10"
-PROXY_PORT = 1337
-PROXY_HOST_PORT = 31337
+PROXY_PORT = 1337          # inside the proxy container; Docker picks the host one
 
 PORT_MIN = 30000
 PORT_MAX = 30005
@@ -79,6 +78,10 @@ def world(real_client):
     threading.Thread(target=server.serve_forever, daemon=True).start()
     port = server.socket.getsockname()[1]
     proxy = start_proxy(real_client, "http://%s:%d" % (gateway, port))
+    # Whatever host port Docker handed us is the one players would arrive on --
+    # asking for a fixed one only picks a fight with whatever else is running.
+    proxy.host_port = published_port(proxy)
+    instancer.PROXY_PORT = proxy.host_port
 
     yield proxy
     server.shutdown()
@@ -99,7 +102,7 @@ CONFIG = {
     "SUBNET_PREFIX": 24,
     "PROXY_CONTAINER": PROXY_NAME,
     "PROXY_TOKEN": TOKEN,
-    "PROXY_PORT": PROXY_HOST_PORT,
+    "PROXY_PORT": 0,       # replaced once Docker has published the proxy
 }
 
 
@@ -116,11 +119,17 @@ def start_proxy(client, instancer_url):
             "MODE": "netcat",
         },
         host_config=client.api.create_host_config(
-            port_bindings={PROXY_PORT: ("127.0.0.1", PROXY_HOST_PORT)}),
+            port_bindings={PROXY_PORT: ("127.0.0.1",)}),
         networking_config=client.api.create_networking_config(
             {CONTROL_NET: endpoint}))
     client.api.start(container)
     return client.containers.get(PROXY_NAME)
+
+
+def published_port(container):
+    container.reload()
+    bindings = container.attrs["NetworkSettings"]["Ports"]["%d/tcp" % PROXY_PORT]
+    return int(bindings[0]["HostPort"])
 
 
 @pytest.fixture
@@ -162,6 +171,11 @@ def remove_instances(client):
         network.remove()
 
 
+def port_of(container):
+    """The instance's port -- a label, not something the player is handed."""
+    return int(container.labels["spawnzero.port"])
+
+
 def instances(client):
     return [c for c in client.containers.list() if c.name.startswith(PREFIX)]
 
@@ -176,12 +190,12 @@ def networks(client):
 
 # --- talking to the proxy -----------------------------------------------------
 
-def play(key, timeout=20):
+def play(proxy, key, timeout=20):
     """Do what a player does: connect to the proxy, hand over the key, read."""
     deadline = time.time() + timeout
     while True:
         try:
-            with socket.create_connection(("127.0.0.1", PROXY_HOST_PORT), timeout=3) as sock:
+            with socket.create_connection(("127.0.0.1", proxy.host_port), timeout=3) as sock:
                 sock.settimeout(3)
                 sock.recv(4096)                     # the key prompt
                 sock.sendall(key.encode() + b"\n")
@@ -238,16 +252,15 @@ def test_lifecycle(web, world):
 
     created = web.post("/create", json={"ttl": 120}).get_json()
     assert created["running"] is True
-    assert PORT_MIN <= created["port"] <= PORT_MAX
     assert created["mode"] == "netcat"
-    assert created["proxy_port"] == PROXY_HOST_PORT
+    assert created["proxy_port"] == world.host_port
     assert 0 < created["remaining_time"] <= 120
 
     container = instances(client)[0]
     assert container.status == "running"
-    owner = container.labels["ctf.owner"]
-    assert container.labels["ctf.key"] == created["key"]
-    assert container.labels["ctf.port"] == str(created["port"])
+    owner = container.labels["spawnzero.owner"]
+    assert container.labels["spawnzero.key"] == created["key"]
+    assert PORT_MIN <= port_of(container) <= PORT_MAX
 
     # nothing of the instance is published: the proxy is the only way in
     assert not (container.attrs["NetworkSettings"]["Ports"] or {})
@@ -257,7 +270,7 @@ def test_lifecycle(web, world):
     assert net.attrs["Internal"] is True
     subnet = net.attrs["IPAM"]["Config"][0]["Subnet"]
     assert subnet.startswith("10.241.")
-    assert container.labels["ctf.subnet"] == subnet
+    assert container.labels["spawnzero.subnet"] == subnet
 
     # ...and the proxy is on that network, so it can dial in
     assert PROXY_NAME in {c["Name"] for c in net.attrs["Containers"].values()}
@@ -274,12 +287,12 @@ def test_lifecycle(web, world):
 
 def test_the_key_gets_a_player_through_the_proxy(web, world):
     key = web.post("/create").get_json()["key"]
-    assert "Special gifts" in play(key)
+    assert "Special gifts" in play(world, key)
 
 
 def test_another_key_gets_nobody_anywhere(web, world):
     web.post("/create").get_json()
-    with socket.create_connection(("127.0.0.1", PROXY_HOST_PORT), timeout=5) as sock:
+    with socket.create_connection(("127.0.0.1", world.host_port), timeout=5) as sock:
         sock.settimeout(5)
         sock.recv(4096)
         sock.sendall(b"f" * 32 + b"\n")
@@ -288,9 +301,9 @@ def test_another_key_gets_nobody_anywhere(web, world):
 
 def test_a_destroyed_instances_key_stops_working(web, world):
     key = web.post("/create").get_json()["key"]
-    play(key)                                # it worked a moment ago
+    play(world, key)                         # it worked a moment ago
     web.post("/destroy")
-    with socket.create_connection(("127.0.0.1", PROXY_HOST_PORT), timeout=5) as sock:
+    with socket.create_connection(("127.0.0.1", world.host_port), timeout=5) as sock:
         sock.settimeout(5)
         sock.recv(4096)
         sock.sendall(key.encode() + b"\n")
@@ -317,11 +330,11 @@ def test_an_instance_can_reach_nothing_but_its_own_subnet(web, world):
 
 
 def test_the_proxy_can_reach_the_instance(web, world):
-    created = web.post("/create").get_json()
+    web.post("/create")
     client = instancer.client()
     instance = instances(client)[0]
     network = networks(client)[0].name
-    assert dial_from(world, address_on(instance, network), created["port"])
+    assert dial_from(world, address_on(instance, network), port_of(instance))
 
 
 def test_two_sessions_are_strangers(web, world):
@@ -332,14 +345,14 @@ def test_two_sessions_are_strangers(web, world):
     mine = web.post("/create").get_json()
     theirs = other.post("/create").get_json()
     assert mine["key"] != theirs["key"]
-    assert mine["port"] != theirs["port"]
     assert len(instances(client)) == 2
+    assert len({port_of(c) for c in instances(client)}) == 2
     assert len({n.attrs["IPAM"]["Config"][0]["Subnet"] for n in networks(client)}) == 2
 
     # neither instance's network can carry a packet to the other
     a, b = instances(client)
-    net_a = instancer.network_name(a.labels["ctf.owner"])
-    assert not can_reach(b, address_on(a, net_a), int(a.labels["ctf.port"]))
+    net_a = instancer.network_name(a.labels["spawnzero.owner"])
+    assert not can_reach(b, address_on(a, net_a), port_of(a))
 
 
 # --- reaping and failure ------------------------------------------------------
@@ -356,7 +369,7 @@ def test_reaper_destroys_expired_instance(web, world):
 
 def test_create_fails_cleanly_on_bad_image(web, world, monkeypatch):
     client = instancer.client()
-    monkeypatch.setattr(instancer, "CHALLENGE_IMAGE", "ctf-challenge:does-not-exist")
+    monkeypatch.setattr(instancer, "CHALLENGE_IMAGE", "spawnzero-challenge:does-not-exist")
     response = web.post("/create")
     assert response.status_code == 500
     assert response.get_json()["running"] is False

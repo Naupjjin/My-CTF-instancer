@@ -1,4 +1,4 @@
-"""Minimal CTF instancer.
+"""SpawnZero: a minimal CTF instancer.
 
 One challenge, one instance per browser session. Creating an instance hands out
 four things that belong to nobody else:
@@ -33,17 +33,17 @@ INSTANCE_PORT_MIN = int(os.environ.get("INSTANCE_PORT_MIN", "30000"))
 INSTANCE_PORT_MAX = int(os.environ.get("INSTANCE_PORT_MAX", "30100"))
 
 CHALLENGE_DIR = os.environ.get("CHALLENGE_DIR", "/challenge")
-CHALLENGE_IMAGE = os.environ.get("CHALLENGE_IMAGE", "ctf-challenge:latest")
+CHALLENGE_IMAGE = os.environ.get("CHALLENGE_IMAGE", "spawnzero-challenge:latest")
 FORCE_BUILD = os.environ.get("FORCE_BUILD", "").lower() in ("1", "true", "yes")
 LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "5000"))
 SECRET_KEY = os.environ.get("SECRET_KEY")
-CONTAINER_PREFIX = "ctf-instance-"
-NETWORK_PREFIX = "ctf-network-"
+CONTAINER_PREFIX = "spawnzero-instance-"
+NETWORK_PREFIX = "spawnzero-network-"
 
 # The proxy: one container, one published port, attached to every instance
 # network by us. PROXY_HOST is only needed when players reach the proxy under a
 # different name than the instancer -- empty means "same host as this page".
-PROXY_CONTAINER = os.environ.get("PROXY_CONTAINER", "ctf-proxy")
+PROXY_CONTAINER = os.environ.get("PROXY_CONTAINER", "spawnzero-proxy")
 PROXY_HOST = os.environ.get("PROXY_HOST", "")
 PROXY_PORT = int(os.environ.get("PROXY_PORT", "1337"))
 PROXY_TOKEN = os.environ.get("PROXY_TOKEN", "")
@@ -77,11 +77,18 @@ MAX_TTL = int(os.environ.get("MAX_TTL", "86400"))
 CLEANUP_INTERVAL = int(os.environ.get("CLEANUP_INTERVAL", "10"))
 
 # Metadata we stash on Docker objects so a restart can recover the state.
-LABEL_OWNER = "ctf.owner"
-LABEL_EXPIRES = "ctf.expires_at"
-LABEL_SUBNET = "ctf.subnet"
-LABEL_PORT = "ctf.port"
-LABEL_KEY = "ctf.key"
+LABEL_OWNER = "spawnzero.owner"
+LABEL_EXPIRES = "spawnzero.expires_at"
+LABEL_SUBNET = "spawnzero.subnet"
+LABEL_PORT = "spawnzero.port"
+LABEL_KEY = "spawnzero.key"
+
+# What a player is told when something breaks. Docker's own messages name
+# images, ports, subnets and container ids -- all of it ours to read in the log,
+# none of it theirs to see in a browser.
+ERROR_BUSY = "no free instance right now, try again in a moment"
+ERROR_CREATE = "could not start your instance, try again in a moment"
+ERROR_DESTROY = "could not stop your instance, try again in a moment"
 
 # How players reach the instance decides how we show the address:
 #   http   -> a clickable http://proxy:port/<key>/ link  (web challenges)
@@ -375,6 +382,12 @@ def requested_ttl():
 
 
 def instance_json(container):
+    """What the player's page gets: how to connect, and how long they have.
+
+    Deliberately not in here: the instance's port, its address, its subnet, its
+    container name. A player cannot route to any of it, so telling them only
+    describes our machinery.
+    """
     expires_at = instance_expires_at(container)
     remaining = max(0, expires_at - int(time.time())) if expires_at is not None else None
     return jsonify(
@@ -383,7 +396,6 @@ def instance_json(container):
         key=label(container, LABEL_KEY),
         proxy_host=PROXY_HOST or None,
         proxy_port=PROXY_PORT,
-        port=instance_port(container),
         expires_at=expires_at,
         remaining_time=remaining,
     )
@@ -442,7 +454,11 @@ def create():
                 remove_instance(owner)
             except (DockerException, OSError) as cleanup_exc:
                 log.error("cleanup after failed create: %s", cleanup_exc)
-            return jsonify(running=False, error=str(exc), mode=MODE), 500
+            # pick_port/pick_subnet raise RuntimeError when the pools are full --
+            # the one failure a player can actually do something about (wait).
+            if isinstance(exc, RuntimeError):
+                return jsonify(running=False, mode=MODE, error=ERROR_BUSY), 503
+            return jsonify(running=False, mode=MODE, error=ERROR_CREATE), 500
 
         log.info("instance created for %s: %s port %d, subnet %s, ttl %ds",
                  owner, instance_address(container) or "?", port, subnet, ttl)
@@ -459,7 +475,7 @@ def destroy():
             removed = remove_instance(owner)
         except Exception as exc:
             log.error("destroy failed for %s: %s", owner, exc)
-            return jsonify(running=True, error=str(exc), mode=MODE), 500
+            return jsonify(running=True, mode=MODE, error=ERROR_DESTROY), 500
     if removed:
         log.info("instance destroyed for %s", owner)
     return idle_json()

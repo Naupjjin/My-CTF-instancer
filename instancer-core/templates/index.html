@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>CTF//INSTANCER</title>
+<title>SPAWNZERO</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&family=VT323&display=swap" rel="stylesheet">
@@ -149,7 +149,7 @@
 <body>
 <div id="frame">
   <div id="titlebar">
-    <span class="brand pixel glitch" data-text="CTF//INSTANCER">CTF//INSTANCER</span>
+    <span class="brand pixel glitch" data-text="SPAWN//ZERO">SPAWN//ZERO</span>
     <span class="dots"><i class="s"></i><i class="a"></i><i class="r"></i></span>
   </div>
 
@@ -157,7 +157,7 @@
     <div id="boot"></div>
 
     <div id="console">
-      <h1 class="pixel">CTF INSTANCER</h1>
+      <h1 class="pixel">SPAWNZERO</h1>
 
       <div class="row">
         <span class="lbl pixel">STATUS</span>
@@ -187,7 +187,7 @@
 
       <div class="row">
         <span class="lbl pixel">LIFETIME</span>
-        <span class="muted"><span id="ttlcfg">--</span>s // set in docker-compose</span>
+        <span class="muted"><span id="ttlcfg">--</span>s per instance</span>
       </div>
 
       <div id="actions">
@@ -230,11 +230,9 @@ let countdown = null;
 
 /* ---------- boot sequence (typewriter, runs once) ---------- */
 const BOOT_LINES = [
-  "PIX-DOS 2.0  soft systems (c) 199X",
+  "SPAWNZERO 1.0  spawn systems (c) 199X",
   "MEM CHECK ........ 640K OK",
-  "DOCKER LINK ...... <b>ONLINE</b>",
-  "PROXY LINK ....... <b>" + (PROXY_HOST || "LOCAL") + ":" + PROXY_PORT + "</b>",
-  "MODE ............. <b>" + MODE.toUpperCase() + "</b>",
+  "LINK ............. <b>ONLINE</b>",
   "READY.",
 ];
 function typewriter(lines, done) {

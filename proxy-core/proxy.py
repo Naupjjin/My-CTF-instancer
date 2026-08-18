@@ -1,4 +1,4 @@
-"""The only door into an instance.
+"""SpawnZero's proxy: the only door into an instance.
 
 Instances live on internal networks with no gateway, so nothing can route to
 them -- except this proxy, which the instancer attaches to every instance
@@ -42,7 +42,7 @@ IDLE_TIMEOUT = int(os.environ.get("IDLE_TIMEOUT", "300"))
 
 # Keys are hex out of secrets.token_hex; anything else is not worth a lookup.
 KEY_RE = re.compile(r"\A[0-9a-f]{8,128}\Z")
-COOKIE_NAME = "ctf_key"
+COOKIE_NAME = "sz_key"
 
 BUFSIZE = 65536
 MAX_HEAD = 65536      # a request head larger than this is not a challenge request
@@ -141,7 +141,7 @@ def read_until(sock, terminator, limit):
 
 # --- netcat mode --------------------------------------------------------------
 
-PROMPT = b"ctf proxy // paste the key your instance was created with\nkey: "
+PROMPT = b"spawnzero // paste the key your instance was created with\nkey: "
 NO_ROUTE = b"no instance for that key\n"
 
 

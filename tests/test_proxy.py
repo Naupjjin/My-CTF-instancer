@@ -228,11 +228,11 @@ def test_http_keeps_the_query_string(front, http):
 @pytest.mark.parametrize("instance", [Web], indirect=True)
 def test_http_sets_a_cookie_so_absolute_links_keep_working(front, http):
     answer = get(front, b"/" + KEY.encode() + b"/")
-    assert b"Set-Cookie: ctf_key=" + KEY.encode() in answer
+    assert b"Set-Cookie: sz_key=" + KEY.encode() in answer
 
     # ...and that cookie alone routes the challenge's own absolute paths
     followed = get(front, b"/static/app.js",
-                   b"Cookie: ctf_key=" + KEY.encode() + b"\r\n")
+                   b"Cookie: sz_key=" + KEY.encode() + b"\r\n")
     assert b"GET /static/app.js HTTP/1.1" in followed
     assert b"Set-Cookie" not in followed                 # nothing new to remember
 
@@ -254,7 +254,7 @@ def test_http_without_a_key_goes_nowhere(front, http):
 @pytest.mark.parametrize("instance", [Web], indirect=True)
 def test_http_with_someone_elses_key_goes_nowhere(front, http):
     assert get(front, b"/" + OTHER_KEY.encode() + b"/").startswith(b"HTTP/1.1 404")
-    assert get(front, b"/x", b"Cookie: ctf_key=" + OTHER_KEY.encode()
+    assert get(front, b"/x", b"Cookie: sz_key=" + OTHER_KEY.encode()
                + b"\r\n").startswith(b"HTTP/1.1 404")
 
 
@@ -274,10 +274,10 @@ def test_split_key():
 
 
 def test_cookie_key_ignores_other_cookies():
-    head = b"GET / HTTP/1.1\r\nCookie: theme=dark; ctf_key=%s\r\n\r\n" % KEY.encode()
+    head = b"GET / HTTP/1.1\r\nCookie: theme=dark; sz_key=%s\r\n\r\n" % KEY.encode()
     assert proxy.cookie_key(head) == KEY
     assert proxy.cookie_key(b"GET / HTTP/1.1\r\nCookie: theme=dark\r\n\r\n") is None
-    assert proxy.cookie_key(b"GET / HTTP/1.1\r\nCookie: ctf_key=nope\r\n\r\n") is None
+    assert proxy.cookie_key(b"GET / HTTP/1.1\r\nCookie: sz_key=nope\r\n\r\n") is None
 
 
 def test_read_until_returns_what_came_after_the_terminator():

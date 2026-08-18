@@ -25,14 +25,14 @@ services:
       # Shared with the proxy: what the proxy shows to prove a key lookup is
       # really coming from it. Change it in .env for anything but a local run.
       PROXY_TOKEN: ${PROXY_TOKEN:-dev-proxy-token}
-      PROXY_CONTAINER: ctf-proxy
+      PROXY_CONTAINER: spawnzero-proxy
       PROXY_PORT: ${PROXY_PORT:-1337}
       # Set this only when players reach the proxy under a different name than
       # this page (a second host, a DNS name). Empty = same host as the UI.
       PROXY_HOST: ${PROXY_HOST:-}
       LISTEN_PORT: ${LISTEN_PORT:-5000}
       CHALLENGE_DIR: /challenge
-      CHALLENGE_IMAGE: ctf-challenge:latest
+      CHALLENGE_IMAGE: spawnzero-challenge:latest
       # The challenge image is built once, only if missing, so startup is instant
       # on every boot after the first. Set FORCE_BUILD=1 after editing the
       # challenge to rebuild it on the next start.
@@ -65,7 +65,7 @@ services:
     # Fixed name and fixed address: the instancer attaches this container to
     # every instance network, and the proxy binds this one address so that the
     # instance networks it joins have nothing to connect back to.
-    container_name: ctf-proxy
+    container_name: spawnzero-proxy
     ports:
       - "${PROXY_PORT:-1337}:${PROXY_PORT:-1337}"
     networks:
@@ -81,7 +81,7 @@ services:
 
 networks:
   control:
-    name: ctf-control
+    name: spawnzero-control
     ipam:
       config:
         - subnet: 10.239.0.0/24

@@ -217,6 +217,11 @@ def only_network(daemon):
     return next(iter(daemon.networks.values()))
 
 
+def port_of(container):
+    """The instance's port -- a label now, no longer anything the player sees."""
+    return int(container.labels["spawnzero.port"])
+
+
 def idle(mode="http"):
     return {"running": False, "mode": mode, "proxy_host": None, "proxy_port": 1337}
 
@@ -230,7 +235,7 @@ def lookup(web, key, token=TOKEN):
 
 def test_index_serves_ui(web):
     body = web.get("/").get_data(as_text=True)
-    assert "CTF INSTANCER" in body
+    assert "SPAWNZERO" in body
     assert "START" in body
     assert "STOP" in body
 
@@ -252,7 +257,6 @@ def test_session_comes_from_the_page_not_from_polling(daemon):
 def test_create_starts_container_and_network(web, daemon):
     data = web.post("/create").get_json()
     assert data["running"] is True
-    assert instancer.INSTANCE_PORT_MIN <= data["port"] <= instancer.INSTANCE_PORT_MAX
     assert data["mode"] == "http"
     assert data["proxy_port"] == 1337
     assert data["expires_at"] is not None
@@ -262,13 +266,15 @@ def test_create_starts_container_and_network(web, daemon):
 
     container = only_container(daemon)
     assert container.status == "running"
-    assert container.network == instancer.network_name(container.labels["ctf.owner"])
+    assert instancer.INSTANCE_PORT_MIN <= port_of(container) <= instancer.INSTANCE_PORT_MAX
+    assert container.network == instancer.network_name(container.labels["spawnzero.owner"])
     only_network(daemon)
 
 
 def test_the_instance_is_told_which_port_to_listen_on(web, daemon):
-    port = web.post("/create").get_json()["port"]
-    assert only_container(daemon).environment == {"CHAL_PORT": str(port)}
+    web.post("/create")
+    container = only_container(daemon)
+    assert container.environment == {"CHAL_PORT": str(port_of(container))}
 
 
 def test_nothing_is_published_to_the_host(web, daemon):
@@ -280,7 +286,6 @@ def test_status_reports_running_instance(web, daemon):
     created = web.post("/create").get_json()
     status = web.get("/status").get_json()
     assert status["running"] is True
-    assert status["port"] == created["port"]
     assert status["key"] == created["key"]
     assert status["expires_at"] == created["expires_at"]
     assert status["remaining_time"] <= created["remaining_time"]
@@ -289,7 +294,6 @@ def test_status_reports_running_instance(web, daemon):
 def test_create_is_idempotent_within_a_session(web, daemon):
     first = web.post("/create").get_json()
     second = web.post("/create").get_json()
-    assert first["port"] == second["port"]
     assert first["key"] == second["key"]
     assert daemon.create_calls == 1
     assert daemon.network_calls == 1
@@ -319,9 +323,9 @@ def test_failed_create_cleans_up_container_and_network(web, daemon):
     assert daemon.networks == {}          # network rolled back too
 
     daemon.fail_start = False
-    retry = web.post("/create").get_json()
-    assert retry["running"] is True
-    assert retry["port"] == instancer.INSTANCE_PORT_MIN   # port not wrongly marked used
+    assert web.post("/create").get_json()["running"] is True
+    # the port of the rolled-back attempt was never marked used
+    assert port_of(only_container(daemon)) == instancer.INSTANCE_PORT_MIN
 
 
 def test_concurrent_create_in_one_session(daemon):
@@ -333,7 +337,7 @@ def test_concurrent_create_in_one_session(daemon):
     assert daemon.create_calls == 1
     assert len(daemon.containers) == 1
     assert len(daemon.networks) == 1
-    assert results[0]["port"] == results[1]["port"]
+    assert results[0]["key"] == results[1]["key"]
 
 
 def run_together(workers):
@@ -353,10 +357,9 @@ def test_existing_container_is_adopted_across_restart(web, daemon):
     restarted.set_cookie("session", web.get_cookie("session").value)
 
     status = restarted.get("/status").get_json()
-    assert status["port"] == created["port"]
     assert status["key"] == created["key"]
     assert status["expires_at"] == created["expires_at"]
-    assert restarted.post("/create").get_json()["port"] == created["port"]
+    assert restarted.post("/create").get_json()["key"] == created["key"]
     assert daemon.create_calls == 1   # not recreated
 
 
@@ -371,14 +374,28 @@ def test_stale_container_and_network_are_cleaned_up(web, daemon):
 def test_labels_carry_metadata(web, daemon):
     created = web.post("/create").get_json()
     container = only_container(daemon)
-    owner = container.labels["ctf.owner"]
-    assert container.labels["ctf.expires_at"].isdigit()
-    assert container.labels["ctf.port"] == str(created["port"])
-    assert container.labels["ctf.key"] == created["key"]
-    assert ipaddress.ip_network(container.labels["ctf.subnet"]).prefixlen == 24
+    owner = container.labels["spawnzero.owner"]
+    assert container.labels["spawnzero.expires_at"].isdigit()
+    assert instancer.INSTANCE_PORT_MIN <= port_of(container) <= instancer.INSTANCE_PORT_MAX
+    assert container.labels["spawnzero.key"] == created["key"]
+    assert ipaddress.ip_network(container.labels["spawnzero.subnet"]).prefixlen == 24
     network = only_network(daemon)
-    assert network.labels["ctf.owner"] == owner
-    assert network.labels["ctf.subnet"] == container.labels["ctf.subnet"]
+    assert network.labels["spawnzero.owner"] == owner
+    assert network.labels["spawnzero.subnet"] == container.labels["spawnzero.subnet"]
+
+
+def test_a_player_is_told_only_what_they_can_use(web, daemon):
+    # How to connect, and how long they have. Nothing about our machinery.
+    assert set(web.post("/create").get_json()) == {
+        "running", "mode", "key", "proxy_host", "proxy_port",
+        "expires_at", "remaining_time"}
+
+
+def test_a_failure_does_not_hand_the_player_our_logs(web, daemon):
+    daemon.fail_start = True
+    answer = web.post("/create").get_json()
+    assert answer["error"] == instancer.ERROR_CREATE
+    assert "start failed" not in repr(answer)     # Docker's words stay in the log
 
 
 # --- network isolation --------------------------------------------------------
@@ -428,10 +445,11 @@ def test_key_is_unguessable_and_unique_per_session(web, other, daemon):
 
 
 def test_route_resolves_a_key_to_its_instance(web, daemon):
+    # The proxy is the one caller that does get the address and the port.
     created = web.post("/create").get_json()
-    route = lookup(web, created["key"]).get_json()
     container = only_container(daemon)
-    assert route == {"host": container.ip, "port": created["port"]}
+    assert lookup(web, created["key"]).get_json() == {
+        "host": container.ip, "port": port_of(container)}
 
 
 def test_route_needs_the_proxy_token(web, daemon):
@@ -468,17 +486,22 @@ def test_key_of_a_stopped_instance_does_not_route(web, daemon):
 def test_ports_outside_range_are_never_used(web, daemon, monkeypatch):
     monkeypatch.setattr(instancer, "INSTANCE_PORT_MIN", 31020)
     monkeypatch.setattr(instancer, "INSTANCE_PORT_MAX", 31021)
-    assert web.post("/create").get_json()["port"] in (31020, 31021)
+    web.post("/create")
+    assert port_of(only_container(daemon)) in (31020, 31021)
 
 
 def test_two_sessions_get_distinct_ports(web, other, daemon):
-    assert web.post("/create").get_json()["port"] != other.post("/create").get_json()["port"]
+    web.post("/create")
+    other.post("/create")
+    assert len({port_of(c) for c in daemon.containers.values()}) == 2
 
 
 def test_a_destroyed_instance_gives_its_port_back(web, daemon):
-    port = web.post("/create").get_json()["port"]
+    web.post("/create")
+    port = port_of(only_container(daemon))
     web.post("/destroy")
-    assert web.post("/create").get_json()["port"] == port
+    web.post("/create")
+    assert port_of(only_container(daemon)) == port
 
 
 def test_create_fails_when_port_range_exhausted(web, other, daemon, monkeypatch):
@@ -486,8 +509,8 @@ def test_create_fails_when_port_range_exhausted(web, other, daemon, monkeypatch)
     monkeypatch.setattr(instancer, "INSTANCE_PORT_MAX", 31030)
     web.post("/create")
     response = other.post("/create")
-    assert response.status_code == 500
-    assert "no free instance port" in response.get_json()["error"]
+    assert response.status_code == 503
+    assert response.get_json()["error"] == instancer.ERROR_BUSY
     assert len(daemon.containers) == 1
     assert len(daemon.networks) == 1
 
@@ -497,7 +520,7 @@ def test_create_fails_when_port_range_exhausted(web, other, daemon, monkeypatch)
 def test_two_sessions_get_distinct_subnets(web, other, daemon):
     web.post("/create")
     other.post("/create")
-    subnets = {c.labels["ctf.subnet"] for c in daemon.containers.values()}
+    subnets = {c.labels["spawnzero.subnet"] for c in daemon.containers.values()}
     assert len(subnets) == 2
     assert len(daemon.networks) == 2
 
@@ -521,7 +544,7 @@ def test_pick_subnet_exhaustion_raises(daemon, monkeypatch):
 
 def test_subnets_come_from_the_pool(web, daemon):
     web.post("/create")
-    subnet = ipaddress.ip_network(only_container(daemon).labels["ctf.subnet"])
+    subnet = ipaddress.ip_network(only_container(daemon).labels["spawnzero.subnet"])
     assert subnet.subnet_of(instancer.SUBNET_POOL)
     assert subnet.prefixlen == 24
 
@@ -561,7 +584,7 @@ def test_ttl_capped_at_max(web, daemon, monkeypatch):
 def test_reaper_destroys_expired_instance(web, daemon):
     web.post("/create")
     container = only_container(daemon)
-    container.labels["ctf.expires_at"] = str(int(time.time()) - 1)   # already expired
+    container.labels["spawnzero.expires_at"] = str(int(time.time()) - 1)   # already expired
     instancer.reap_expired()
     assert daemon.containers == {}
     assert daemon.networks == {}
@@ -579,7 +602,7 @@ def test_reaper_only_kills_the_expired_one(web, other, daemon):
     other.post("/create", json={"ttl": 100})
     # expire exactly one of them
     victim = next(c for c in daemon.containers.values())
-    victim.labels["ctf.expires_at"] = str(int(time.time()) - 1)
+    victim.labels["spawnzero.expires_at"] = str(int(time.time()) - 1)
     instancer.reap_expired()
     assert len(daemon.containers) == 1
     assert victim.name not in daemon.containers

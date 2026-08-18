@@ -63,6 +63,30 @@ CHALLENGE_DIR=./challenge PROXY_TOKEN=... python instancer-core/app.py
 PROXY_BIND=127.0.0.1 PROXY_TOKEN=... python proxy-core/proxy.py
 ```
 
+## Cleaning up
+
+`docker compose down` removes the instancer, the proxy and the control network —
+but **not the instances**. They are created by the instancer at runtime, not by
+compose, so compose does not know about them. That is deliberate: a
+`docker compose restart`, or the instancer crashing, must not take every player's
+instance with it (it re-adopts them from their labels on the way back up).
+
+To actually remove everything, take the stack down first — that frees the proxy's
+endpoint on each instance network — and then clear the instances by label:
+
+```sh
+docker compose down
+docker rm -f $(docker ps -aq --filter label=spawnzero.owner) 2>/dev/null
+docker network rm $(docker network ls -q --filter label=spawnzero.owner) 2>/dev/null
+```
+
+Left alone, instances go away on their own within `DEFAULT_TTL` — but only while
+an instancer is running to reap them.
+
+If a network refuses to go with `has active endpoints`, the proxy is still
+attached: remove the proxy container first, or
+`docker network disconnect -f <network> spawnzero-proxy`.
+
 ## Configuration
 
 Everything is environment variables (defaults in brackets). The instancer:

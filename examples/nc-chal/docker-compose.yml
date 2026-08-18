@@ -1,0 +1,14 @@
+# Run the challenge on its own, the way SpawnZero will run it: straight from the
+# image, with no volumes to mask what was built, and on a port that is NOT the
+# image's default -- so a challenge that ignores $CHAL_PORT fails here, where you
+# are looking, instead of in front of players.
+#
+#   docker compose -f challenge/docker-compose.yml up --build
+#   nc localhost 30000
+services:
+  pwn-special-love:
+    build: ./
+    environment:
+      CHAL_PORT: 30000
+    ports:
+      - 30000:30000

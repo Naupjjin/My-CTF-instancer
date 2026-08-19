@@ -28,11 +28,20 @@ ttl: 3600
 # instance port only exists inside that instance's own network, so it collides
 # with nothing on the host and nothing in another challenge. What the range
 # really decides is how many instances of this challenge can be up at once --
-# 30000-30100 is 101 of them.
+# 30000-30100 is 101 of them, unless max_instances below says fewer.
 subnet_pool: 10.240.0.0/16
 subnet_prefix: 24
 instance_ports: 30000-30100
 
-# Blast radius of one instance. Empty leaves the limit to Docker.
+# A cap of its own, on top of those two: how many instances of this challenge may
+# be up at the same time, whoever asks. 0 leaves it to the port range and the
+# pool. Set it when the ceiling you want is a number of players rather than a
+# consequence of address arithmetic -- or when the challenge is expensive enough
+# that the machine, not the config, is the real limit.
+max_instances: 2
+
+# Blast radius of one instance. `pids_limit` counts processes *and* threads, so
+# a fork bomb runs out of room before the host does. Leaving a key out keeps
+# the default; it takes an explicit 0 (or '' for mem_limit) to lift the ceiling.
 mem_limit: 512m
 pids_limit: 256

@@ -224,14 +224,21 @@ class Challenge:
         self.subnet_pool = config["subnet_pool"]
         self.subnet_prefix = config["subnet_prefix"]
         self.port_min, self.port_max = config["instance_ports"]
+        self.max_instances = config["max_instances"]
         self.image = CHALLENGE_IMAGE.format(chal=cid)
         self.proxy = PROXY_NAME.format(chal=cid)
         self.sigil = sigil(cid)
 
     @property
     def capacity(self):
-        """How many instances of it can be up at once: one port each."""
-        return self.port_max - self.port_min + 1
+        """How many instances of it can be up at once, whichever ceiling is
+        lowest: the port range (one port each), the subnet pool (one /24 each),
+        or a max_instances that says so outright."""
+        ceilings = [self.port_max - self.port_min + 1,
+                    2 ** (self.subnet_prefix - self.subnet_pool.prefixlen)]
+        if self.max_instances:
+            ceilings.append(self.max_instances)
+        return min(ceilings)
 
     def __repr__(self):
         return "<Challenge %s on :%d (%s)>" % (self.id, self.proxy_port, self.mode)
@@ -268,8 +275,9 @@ DEFAULT_CHALLENGE = {
     "subnet_pool": DEFAULT_SUBNET_POOL,
     "subnet_prefix": DEFAULT_SUBNET_PREFIX,
     "instance_ports": DEFAULT_INSTANCE_PORTS,
+    "max_instances": 0,
 }
-CHALLENGE_INTS = ("proxy_port", "ttl", "pids_limit", "subnet_prefix")
+CHALLENGE_INTS = ("proxy_port", "ttl", "pids_limit", "subnet_prefix", "max_instances")
 
 
 def parse_ports(text):
@@ -345,7 +353,19 @@ def load_challenge(cid, directory):
                     config["subnet_prefix"], pool, DEFAULT_SUBNET_PREFIX)
         config["subnet_prefix"] = DEFAULT_SUBNET_PREFIX
     config["subnet_pool"] = pool
-    return Challenge(cid, directory, config)
+
+    if config["max_instances"] < 0:
+        log.warning("%s: max_instances %r is not a number of instances, using 0 "
+                    "(no cap of its own)", cid, config["max_instances"])
+        config["max_instances"] = 0
+    challenge = Challenge(cid, directory, config)
+    if challenge.max_instances and challenge.max_instances > challenge.capacity:
+        # Not an error -- it just never gets to be the ceiling, and saying so
+        # beats letting someone believe they raised a limit they did not.
+        log.warning("%s: max_instances %d is above what its port range and subnet "
+                    "pool allow (%d), so %d is the real limit", cid,
+                    challenge.max_instances, challenge.capacity, challenge.capacity)
+    return challenge
 
 
 def load_challenges(path=None):
@@ -552,21 +572,23 @@ def find_by_key(chal, key):
 
 # --- ports --------------------------------------------------------------------
 
-def used_ports(chal):
-    """Ports already handed to an instance of this challenge.
+def used_ports(chal, reserved=()):
+    """Ports of this challenge that are spoken for: handed to an instance, or
+    claimed by a create that is still building one.
 
     Per challenge, because the port lives inside the instance's own network
-    namespace: two challenges may hand out the same number all day.
+    namespace: two challenges may hand out the same number all day. One entry
+    per instance, so the size of this set is also how many are out.
     """
-    return {port for port in (instance_port(c) for c in list_instances(chal))
+    live = {port for port in (instance_port(c) for c in list_instances(chal))
             if port is not None}
+    return live | {port for c, port in reserved if c == chal}
 
 
-def pick_port(chal, reserved=()):
+def pick_port(chal, taken):
     """A port free in this challenge's own range."""
-    used = used_ports(chal.id) | {port for c, port in reserved if c == chal.id}
     for port in range(chal.port_min, chal.port_max + 1):
-        if port not in used:
+        if port not in taken:
             return port
     raise RuntimeError("no free instance port in %d-%d for %s"
                        % (chal.port_min, chal.port_max, chal.id))
@@ -616,12 +638,19 @@ def reserve(chal):
     """Take a port and a subnet nobody else can be given.
 
     Both come out of this challenge's own config: its port range and its subnet
-    pool. Held under pool_lock only long enough to read what Docker has and
-    write the claim; the slow part -- building the network and the container --
-    happens with the lock released, so everyone else can be picking meanwhile.
+    pool. Its max_instances is checked here too, and for the same reason the
+    picking is here -- under one lock, counting what Docker holds *and* what the
+    creates still building have claimed, so two players arriving at once cannot
+    both be handed the last slot. Held only long enough to read and write the
+    claim; the slow part -- building the network and the container -- happens
+    with the lock released, so everyone else can be picking meanwhile.
     """
     with pool_lock:
-        port = pick_port(chal, reserved_ports)
+        taken = used_ports(chal.id, reserved_ports)
+        if chal.max_instances and len(taken) >= chal.max_instances:
+            raise RuntimeError("%s is full: %d of %d instances already out"
+                               % (chal.id, len(taken), chal.max_instances))
+        port = pick_port(chal, taken)
         subnet = pick_subnet(chal, reserved_subnets)
         reserved_ports.add((chal.id, port))
         reserved_subnets.add(subnet)

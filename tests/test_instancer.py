@@ -241,13 +241,13 @@ PORTS = "31000-31010"
 
 
 def make_challenge(cid, mode="http", port=1337, ttl=3600, pool=None, ports=PORTS,
-                   **extra):
+                   cap=0, **extra):
     config = dict(instancer.DEFAULT_CHALLENGE, mode=mode, proxy_port=port, ttl=ttl,
                   name=cid.replace("-", " ").title(), author="naup",
                   type="pwn" if mode == "netcat" else "web",
                   subnet_pool=ipaddress.ip_network(pool or POOLS.get(cid, "10.102.0.0/16")),
                   subnet_prefix=24, instance_ports=instancer.parse_ports(ports),
-                  **extra)
+                  max_instances=cap, **extra)
     return instancer.Challenge(cid, "/challenges/" + cid, config)
 
 
@@ -562,6 +562,36 @@ def test_a_subnet_prefix_that_does_not_divide_the_pool_falls_back(tmp_path, capl
     assert "does not divide" in caplog.text
 
 
+def test_a_challenge_may_cap_how_many_of_it_run_at_once(tmp_path):
+    write_challenge(tmp_path, "few", "proxy_port: 9000\ninstance_ports: 40000-40099\n"
+                                     "max_instances: 8\n")
+    chal = instancer.load_challenges(str(tmp_path))["few"]
+    assert chal.max_instances == 8
+    assert chal.capacity == 8            # the cap is what binds, not the 100 ports
+
+
+def test_without_a_cap_the_range_and_the_pool_decide(tmp_path):
+    write_challenge(tmp_path, "open", "proxy_port: 9000\ninstance_ports: 40000-40099\n"
+                                      "subnet_pool: 10.9.0.0/22\nsubnet_prefix: 24\n")
+    chal = instancer.load_challenges(str(tmp_path))["open"]
+    assert chal.max_instances == 0
+    assert chal.capacity == 4            # a /22 in /24s, not the 100 ports
+
+
+def test_a_cap_above_what_the_pools_allow_is_said_out_loud(tmp_path, caplog):
+    write_challenge(tmp_path, "hopeful", "proxy_port: 9000\ninstance_ports: 40000-40009\n"
+                                         "max_instances: 500\n")
+    chal = instancer.load_challenges(str(tmp_path))["hopeful"]
+    assert chal.capacity == 10           # the ten ports still win
+    assert "so 10 is the real limit" in caplog.text
+
+
+def test_a_negative_cap_is_no_cap(tmp_path, caplog):
+    write_challenge(tmp_path, "odd", "proxy_port: 9000\nmax_instances: -3\n")
+    assert instancer.load_challenges(str(tmp_path))["odd"].max_instances == 0
+    assert "not a number of instances" in caplog.text
+
+
 def test_challenges_are_served_in_a_stable_order(tmp_path):
     for cid in ("zeta", "alpha", "middle"):
         write_challenge(tmp_path, cid, "proxy_port: %d\n" % (9000 + len(cid)))
@@ -785,6 +815,58 @@ def test_a_requested_ttl_is_ignored(web, daemon, chal):
     """Nobody gets to ask for a longer instance -- the challenge decides."""
     data = create(web, chal.id, json={"ttl": 999999}).get_json()
     assert 0 < data["remaining_time"] <= chal.ttl
+
+
+# --- the cap ------------------------------------------------------------------
+
+def test_a_full_challenge_turns_the_next_player_away(daemon, monkeypatch, web, other):
+    capped = add_challenge(monkeypatch, make_challenge("capped", port=1402, cap=1))
+    assert create(web, capped.id).get_json()["running"] is True
+    response = create(other, capped.id)
+    assert response.status_code == 503
+    assert response.get_json()["error"] == instancer.ERROR_BUSY
+    assert len(instances(daemon, capped.id)) == 1
+
+
+def test_a_full_challenge_still_hands_you_back_your_own(daemon, monkeypatch, web, other):
+    capped = add_challenge(monkeypatch, make_challenge("capped", port=1402, cap=1))
+    mine = create(web, capped.id).get_json()
+    create(other, capped.id)                       # fills nothing, it is already full
+    assert create(web, capped.id).get_json()["key"] == mine["key"]
+
+
+def test_a_freed_slot_goes_to_the_next_player(daemon, monkeypatch, web, other):
+    capped = add_challenge(monkeypatch, make_challenge("capped", port=1402, cap=1))
+    create(web, capped.id)
+    assert create(other, capped.id).status_code == 503
+    destroy(web, capped.id)
+    assert create(other, capped.id).get_json()["running"] is True
+
+
+def test_the_cap_is_one_challenges_own(daemon, monkeypatch, web, chal):
+    capped = add_challenge(monkeypatch, make_challenge("capped", port=1402, cap=1))
+    other = instancer.app.test_client(); other.get("/")
+    create(web, capped.id)
+    assert create(other, capped.id).status_code == 503   # that one is full
+    assert create(other, chal.id).get_json()["running"] is True   # this one is not
+
+
+def test_a_crowd_cannot_squeeze_past_the_cap(daemon, monkeypatch):
+    """Two players arriving at once must not both be handed the last slot."""
+    capped = add_challenge(monkeypatch, make_challenge("capped", port=1402, cap=5))
+    daemon.create_delay = 0.02
+    _, answers = crowd(daemon, capped.id, count=16)
+    started = [a for a in answers if a.get("running")]
+    assert len(started) == 5
+    assert len(instances(daemon, capped.id)) == 5
+    assert all(a["error"] == instancer.ERROR_BUSY
+               for a in answers if not a.get("running"))
+
+
+def test_the_cap_is_what_the_page_promises(daemon, monkeypatch, web):
+    add_challenge(monkeypatch, make_challenge("capped", port=1402, cap=7))
+    body = web.get("/c/capped").get_data(as_text=True)
+    assert "UP TO 7 AT ONCE" in body
 
 
 # --- a crowd ------------------------------------------------------------------

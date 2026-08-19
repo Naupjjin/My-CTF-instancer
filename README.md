@@ -152,9 +152,10 @@ ttl: 3600                   # instance lifetime, seconds
 subnet_pool: 10.240.0.0/16  # where its instances live: one /24 each
 subnet_prefix: 24
 instance_ports: 30000-30100 # one port each, so: up to 101 at once
+max_instances: 0            # ...or a flat cap, if you would rather say it outright
 
 mem_limit: 512m             # blast radius of one instance
-pids_limit: 256
+pids_limit: 256             # processes + threads at once; 0 for no limit
 proxy_host:                 # optional: a hostname just for this challenge
 ```
 
@@ -169,15 +170,17 @@ proxy_host:                 # optional: a hostname just for this challenge
 | `subnet_pool` | `10.240.0.0/16` | the address space its instances are carved out of |
 | `subnet_prefix` | `24` | size of each instance's subnet (a /24 out of a /16 = 256 instances) |
 | `instance_ports` | `30000-30100` | the port range its instances draw from — and so how many can be up at once |
-| `mem_limit` | `512m` | memory ceiling per instance (empty = no limit) |
-| `pids_limit` | `256` | process ceiling per instance (empty or `0` = no limit) |
+| `max_instances` | `0` | a flat ceiling on how many of it may be up at once; `0` leaves that to the range and the pool |
+| `mem_limit` | `512m` | memory ceiling per instance (`''` = no limit) |
+| `pids_limit` | `256` | tasks — processes *and* threads — one instance may have at once (`0` = no limit) |
 | `proxy_host` | `PROXY_HOST` | proxy hostname shown to players (unset = the host serving the UI) |
 
 `proxy_port` is the one setting that must not collide with another challenge's:
 it is a real port on the host. Two challenges asking for the same one is caught
 at startup, and the second is refused with a line naming the first.
 
-The other two are worth understanding, because they look alike and are not:
+The other three are worth understanding, because two of them look alike and are
+not:
 
 * **`subnet_pool` is real address space.** Give each challenge its own. Two
   pointed at the same pool is allowed — every pick is checked against every
@@ -190,10 +193,22 @@ The other two are worth understanding, because they look alike and are not:
   instances of this challenge can be up at once** — one port each, so
   `30000-30100` is 101. Write it as a range, or as a single port for a cap of
   one.
+* **`max_instances` is the ceiling you meant.** The other two cap concurrency as
+  a side effect of address arithmetic; this one says the number. Set it when what
+  you want to limit is players — or when the challenge is heavy enough that the
+  machine, not the config, is the real limit. `0` means it never binds.
 
-Between them, `subnet_pool` / `subnet_prefix` is the other ceiling: a /16 in /24s
-is 256 instances of that challenge. When either runs out, `POST
-/api/<chal>/create` returns `503` and starts nothing.
+Whichever of the three is lowest is the real ceiling, and that is the number the
+page prints as *up to N at once*: a /16 in /24s is 256, `30000-30100` is 101, so
+those two shipped challenges run 101 each until a `max_instances` says otherwise.
+A `max_instances` set above what the pools allow is not an error — it just never
+binds, and startup says so rather than letting you believe you raised a limit you
+did not.
+
+When any of them runs out, `POST /api/<chal>/create` returns `503` and
+`{"error": "no free instance right now, try again in a moment"}`, and starts
+nothing. A player who already has an instance of that challenge still gets it
+back — the cap turns away new instances, not the people holding one.
 
 ### The deployment — environment variables
 
@@ -326,7 +341,11 @@ A bad token, an unknown challenge, an unknown key and a stopped instance all get
 the same indistinguishable `404`.
 
 **Blast radius.** Each instance gets its challenge's `mem_limit` and
-`pids_limit` so one player's fork bomb is one player's problem. Capabilities are
+`pids_limit` so one player's fork bomb is one player's problem: `pids_limit` is
+the Linux pids cgroup, counting processes *and* threads, and the fork that goes
+past it fails with `EAGAIN` inside that container and nowhere else. Leaving
+either key out keeps the default — it takes an explicit `0` (or `''` for
+`mem_limit`) to run an instance with no ceiling at all. Capabilities are
 left alone on purpose: pwn challenges routinely need setuid helpers, and silently
 breaking them would be worse than the marginal hardening.
 
@@ -393,8 +412,9 @@ one running the *previous* config.yml is replaced. A challenge that will not
 build, or cannot get a proxy, is dropped with a line in the log while the rest
 come up.
 
-**Create.** Under two locks (below), the instancer picks a free port for that
-challenge, a free `/24` out of that challenge's `subnet_pool`, and a fresh key; creates
+**Create.** Under two locks (below), the instancer checks that challenge's
+`max_instances`, picks a free port for it, a free `/24` out of its `subnet_pool`,
+and a fresh key; creates
 `ctf-network-<chal>-<id>` as an internal, gatewayless bridge; attaches *that
 challenge's* proxy to it; then creates and starts `ctf-instance-<chal>-<id>` on
 it with the port in `$CHAL_PORT`. If anything fails — including the proxy being
@@ -414,7 +434,11 @@ ride in on the first request's key.
 **A crowd.** Everything that can be handed out twice is handed out under a lock,
 and everything slow happens outside one. Two levels:
 
-* `pool_lock` covers *choosing* a port and a subnet, and nothing else. The choice
+* `pool_lock` covers *counting* what is out and *choosing* a port and a subnet,
+  and nothing else. Counting is in there with the choosing because they answer
+  the same question: two players arriving at once must not both be handed the
+  last slot under `max_instances`, any more than they may be handed the same
+  port. The choice
   is written into `reserved_ports` / `reserved_subnets` before the lock is
   released, because Docker only becomes the record of what is taken once the
   container exists — a second or two later, and two players would be handed the

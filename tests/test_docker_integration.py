@@ -539,6 +539,23 @@ def test_two_sessions_are_strangers(web, world):
     assert not can_reach(b, address_on(a, net_a), port_of(a), shell="sh")
 
 
+def test_a_challenges_cap_holds_against_the_real_daemon(world, monkeypatch):
+    """max_instances is a number of players, not a consequence of arithmetic."""
+    client = instancer.client()
+    monkeypatch.setattr(world[WEB], "max_instances", 2)
+    answers = []
+    for _ in range(4):
+        browser = instancer.app.test_client()
+        browser.get("/")
+        answers.append(browser.post("/api/%s/create" % WEB).get_json())
+    assert len([a for a in answers if a.get("running")]) == 2
+    assert len(instances(client)) == 2
+    assert all(a["error"] == instancer.ERROR_BUSY
+               for a in answers if not a.get("running"))
+    # ...and nothing half-built was left behind by the two that were turned away
+    assert len(networks(client)) == 2
+
+
 # --- reaping and failure ------------------------------------------------------
 
 def test_reaper_destroys_expired_instance(web, world, monkeypatch):

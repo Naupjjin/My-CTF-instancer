@@ -50,11 +50,10 @@ services:
       SUBNET_POOL: 10.240.0.0/16
       SUBNET_PREFIX: 24
       # Instance TTL (seconds): how long each instance lives before the reaper
-      # destroys it. This is THE knob for instance lifetime — the web UI does not
-      # let players choose, it just uses this value.
+      # destroys it. This is THE knob for instance lifetime — the only one. No
+      # request can ask for a longer one; everybody gets this.
       DEFAULT_TTL: 3600
-      # Hard ceiling for a TTL requested via the API; and how often the reaper runs.
-      MAX_TTL: 86400
+      # How often the reaper runs.
       CLEANUP_INTERVAL: 10
     depends_on:
       - proxy

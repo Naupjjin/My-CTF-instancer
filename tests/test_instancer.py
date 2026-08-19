@@ -193,7 +193,6 @@ def daemon(monkeypatch):
     monkeypatch.setattr(instancer, "SUBNET_POOL", ipaddress.ip_network("10.100.0.0/16"))
     monkeypatch.setattr(instancer, "SUBNET_PREFIX", 24)
     monkeypatch.setattr(instancer, "DEFAULT_TTL", 3600)
-    monkeypatch.setattr(instancer, "MAX_TTL", 86400)
     monkeypatch.setattr(instancer, "MODE", "http")
     monkeypatch.setattr(instancer, "PROXY_TOKEN", TOKEN)
     monkeypatch.setattr(instancer, "PROXY_PORT", 1337)
@@ -530,7 +529,7 @@ def test_the_reaper_leaves_a_rebuilt_instance_alone(daemon, monkeypatch):
     its kill must not be reaped in its successor's place."""
     web = instancer.app.test_client()
     web.get("/")
-    web.post("/create", json={"ttl": 1})
+    web.post("/create")
     only_container(daemon).labels["spawnzero.expires_at"] = str(int(time.time()) - 1)
 
     # Slip a rebuild in after the reaper has listed the instance but before it
@@ -762,32 +761,28 @@ def test_subnets_come_from_the_pool(web, daemon):
 
 # --- TTL ----------------------------------------------------------------------
 
-def test_ttl_from_request_body(web, daemon):
+def test_ttl_is_the_configured_default(web, daemon):
     before = int(time.time())
-    data = web.post("/create", json={"ttl": 100}).get_json()
-    assert before + 100 <= data["expires_at"] <= int(time.time()) + 100
+    data = web.post("/create").get_json()
+    assert before + 3600 <= data["expires_at"] <= int(time.time()) + 3600
+    assert 3000 < data["remaining_time"] <= 3600
+
+
+def test_ttl_follows_the_setting(web, daemon, monkeypatch):
+    monkeypatch.setattr(instancer, "DEFAULT_TTL", 100)
+    data = web.post("/create").get_json()
     assert 0 < data["remaining_time"] <= 100
 
 
-def test_ttl_defaults_without_body(web, daemon):
-    data = web.post("/create").get_json()
-    assert data["remaining_time"] > 3000  # ~3600 default
-
-
-def test_ttl_invalid_falls_back_to_default(web, daemon):
-    data = web.post("/create", json={"ttl": "not-a-number"}).get_json()
-    assert data["remaining_time"] > 3000
-
-
-def test_ttl_non_positive_falls_back_to_default(web, daemon):
-    data = web.post("/create", json={"ttl": -5}).get_json()
-    assert data["remaining_time"] > 3000
-
-
-def test_ttl_capped_at_max(web, daemon, monkeypatch):
-    monkeypatch.setattr(instancer, "MAX_TTL", 500)
+def test_a_requested_ttl_is_ignored(web, daemon):
+    """Nobody gets to ask for a longer instance -- there is one lifetime."""
     data = web.post("/create", json={"ttl": 999999}).get_json()
-    assert data["remaining_time"] <= 500
+    assert 3000 < data["remaining_time"] <= 3600
+
+
+def test_a_junk_body_is_ignored(web, daemon):
+    data = web.post("/create", json={"ttl": "not-a-number"}).get_json()
+    assert 3000 < data["remaining_time"] <= 3600
 
 
 # --- reaper -------------------------------------------------------------------
@@ -809,8 +804,8 @@ def test_reaper_keeps_live_instance(web, daemon):
 
 
 def test_reaper_only_kills_the_expired_one(web, other, daemon):
-    web.post("/create", json={"ttl": 100})
-    other.post("/create", json={"ttl": 100})
+    web.post("/create")
+    other.post("/create")
     # expire exactly one of them
     victim = next(c for c in daemon.containers.values())
     victim.labels["spawnzero.expires_at"] = str(int(time.time()) - 1)

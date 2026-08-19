@@ -250,11 +250,11 @@ def test_lifecycle(web, world):
     client = instancer.client()
     assert web.post("/destroy").get_json()["running"] is False
 
-    created = web.post("/create", json={"ttl": 120}).get_json()
+    created = web.post("/create").get_json()
     assert created["running"] is True
     assert created["mode"] == "netcat"
     assert created["proxy_port"] == world.host_port
-    assert 0 < created["remaining_time"] <= 120
+    assert 0 < created["remaining_time"] <= instancer.DEFAULT_TTL
 
     container = instances(client)[0]
     assert container.status == "running"
@@ -385,9 +385,10 @@ def test_two_sessions_are_strangers(web, world):
 
 # --- reaping and failure ------------------------------------------------------
 
-def test_reaper_destroys_expired_instance(web, world):
+def test_reaper_destroys_expired_instance(web, world, monkeypatch):
     client = instancer.client()
-    web.post("/create", json={"ttl": 1})
+    monkeypatch.setattr(instancer, "DEFAULT_TTL", 1)   # the only lifetime there is
+    web.post("/create")
     assert len(instances(client)) == 1
     time.sleep(2)
     instancer.reap_expired()

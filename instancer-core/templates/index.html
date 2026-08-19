@@ -210,8 +210,9 @@
 </div>
 
 <script>
-// Injected by Flask. TTL lifetime and the proxy address are decided by the
-// server (docker-compose); an empty PROXY_HOST means "the host serving this page".
+// Injected by Flask. The instance lifetime and the proxy address are decided by
+// the server (docker-compose); an empty PROXY_HOST means "the host serving this
+// page".
 const INSTANCER_NAME = {{ instancer_name|tojson }};
 const MODE = {{ mode|tojson }};
 const DEFAULT_TTL = {{ default_ttl }};
@@ -328,7 +329,7 @@ async function call(path, method) {
   start.disabled = stop.disabled = false;
 }
 const refresh = () => call("/status", "GET");
-start.onclick = () => call("/create", "POST");   // no ttl -> server DEFAULT_TTL
+start.onclick = () => call("/create", "POST");   // lifetime is the server's DEFAULT_TTL
 stop.onclick  = () => call("/destroy", "POST");
 
 // click a copyable field (the netcat address, the key) to put it on the clipboard

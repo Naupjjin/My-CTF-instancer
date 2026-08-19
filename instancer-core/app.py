@@ -89,9 +89,9 @@ REAP_ON_SHUTDOWN = os.environ.get("REAP_ON_SHUTDOWN", "1").lower() not in ("0", 
 # Docker's own grace period is short; being late is worse than being rude.
 SHUTDOWN_LOCK_WAIT = 5
 
-# TTL: how long an instance lives, and how often the reaper looks.
+# TTL: how long every instance lives, and how often the reaper looks. One
+# lifetime for everybody -- nothing a request can ask to make longer.
 DEFAULT_TTL = int(os.environ.get("DEFAULT_TTL", "3600"))
-MAX_TTL = int(os.environ.get("MAX_TTL", "86400"))
 CLEANUP_INTERVAL = int(os.environ.get("CLEANUP_INTERVAL", "10"))
 
 # Metadata we stash on Docker objects so a restart can recover the state.
@@ -491,17 +491,6 @@ def build_image():
     log.info("challenge image built: %s", CHALLENGE_IMAGE)
 
 
-def requested_ttl():
-    body = request.get_json(silent=True) or {}
-    try:
-        ttl = int(body.get("ttl", DEFAULT_TTL))
-    except (TypeError, ValueError):
-        ttl = DEFAULT_TTL
-    if ttl <= 0:
-        ttl = DEFAULT_TTL
-    return min(ttl, MAX_TTL)
-
-
 def instance_json(container):
     """What the player's page gets: how to connect, and how long they have.
 
@@ -557,7 +546,6 @@ def status():
 @app.post("/create")
 def create():
     owner = owner_id()
-    ttl = requested_ttl()
     if shutting_down.is_set():
         return jsonify(running=False, mode=MODE, error=ERROR_SHUTDOWN), 503
     with owner_lock(owner):
@@ -572,7 +560,7 @@ def create():
         try:
             port, subnet = reserve()
             key = pick_key()
-            expires_at = int(time.time()) + ttl
+            expires_at = int(time.time()) + DEFAULT_TTL
             create_network(owner, subnet)
             attach_proxy(owner)
             container = create_container(owner, port, subnet, key, expires_at)
@@ -595,7 +583,7 @@ def create():
             release(port, subnet)
 
         log.info("instance created for %s: %s port %d, subnet %s, ttl %ds",
-                 owner, instance_address(container) or "?", port, subnet, ttl)
+                 owner, instance_address(container) or "?", port, subnet, DEFAULT_TTL)
         return instance_json(container)
 
 
@@ -752,7 +740,7 @@ def startup():
     log.info("%s serving %r by %s (%s)", CONFIG["instancer_name"], CONFIG["chal_name"],
              CONFIG["author"] or "nobody in particular", CONFIG["type"] or "no type")
     log.info("server started on port %d (mode=%s, proxy %s:%d via %s, instance ports "
-             "%d-%d, subnet pool %s /%d, default ttl %ds, reap on shutdown: %s)",
+             "%d-%d, subnet pool %s /%d, instance ttl %ds, reap on shutdown: %s)",
              LISTEN_PORT, MODE, PROXY_HOST or "<this host>", PROXY_PORT, PROXY_CONTAINER,
              INSTANCE_PORT_MIN, INSTANCE_PORT_MAX, SUBNET_POOL, SUBNET_PREFIX, DEFAULT_TTL,
              "yes" if REAP_ON_SHUTDOWN else "no")

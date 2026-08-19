@@ -133,8 +133,7 @@ Defaults in brackets. The instancer:
 | `SUBNET_PREFIX` | `24` | size of each instance's subnet (a /24 = 256 subnets from a /16) |
 | `MEM_LIMIT` | `512m` | memory ceiling per instance (empty = no limit) |
 | `PIDS_LIMIT` | `256` | process ceiling per instance (empty or `0` = no limit) |
-| `DEFAULT_TTL` | `3600` | instance lifetime in seconds when `/create` gives no `ttl` |
-| `MAX_TTL` | `86400` | ceiling a requested `ttl` is clamped to |
+| `DEFAULT_TTL` | `3600` | instance lifetime in seconds — the same for every instance |
 | `CLEANUP_INTERVAL` | `10` | how often the background reaper checks for expiry (seconds) |
 | `REAP_ON_SHUTDOWN` | `1` | destroy every instance when the instancer is asked to stop; `0` leaves them for the next start to adopt |
 | `LISTEN_PORT` | `5000` | port of the instancer web UI |
@@ -280,9 +279,10 @@ the log.
 | `POST /destroy` | `{"running": false, ...}`, also when you had nothing running |
 | `GET /internal/route/<key>` | `{"host": ..., "port": ...}` for the proxy; `404` without a matching `X-Proxy-Token` |
 
-`POST /create` accepts an optional JSON body `{"ttl": 3600}` — the instance
-lifetime in seconds (defaults to `DEFAULT_TTL`, clamped to `MAX_TTL`). No body is
-fine; the START button sends none.
+`POST /create` takes no parameters. Instance lifetime is `DEFAULT_TTL` and only
+`DEFAULT_TTL`: a request cannot ask for a longer one, so a body is ignored, and
+the only way to change a lifetime is to restart the instancer with a different
+value.
 
 Every player-facing route only ever talks about the caller's own instance.
 `GET /` puts a random id in a Flask session cookie — minted there rather than in
@@ -344,7 +344,7 @@ fine (the dev server is threaded, which is what all of the above is for); severa
 worker *processes* would each keep their own reservation set and could hand out
 the same port twice.
 
-**TTL.** `expires_at = now + ttl` is stamped on the container as a label. A
+**TTL.** `expires_at = now + DEFAULT_TTL` is stamped on the container as a label. A
 background thread wakes every `CLEANUP_INTERVAL` seconds and destroys any
 instance past its `expires_at` (container **and** network), and prunes any
 `spawnzero-network-*` whose container is gone. Removing a network means detaching the

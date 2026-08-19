@@ -24,8 +24,10 @@ proxy: one container, one port, and a key that says which instance you get.
      ┌────────┴────────┐            ┌──────┴──────────┐
      │ internal,       │            │ internal,       │
      │ no gateway      │            │ no gateway      │
-  10.240.0.0/24   10.240.1.0/24  10.240.2.0/24   10.240.3.0/24
+  10.240.0.0/24   10.240.1.0/24  10.241.0.0/24   10.241.1.0/24
   [ instance ]    [ instance ]   [ instance ]    [ instance ]
+  └────── 10.240.0.0/16 ──────┘  └────── 10.241.0.0/16 ──────┘
+           subnet_pool                    subnet_pool
 ```
 
 ```
@@ -210,6 +212,7 @@ Defaults in brackets. The instancer:
 | `CLEANUP_INTERVAL` | `10` | how often the background reaper checks for expiry (seconds) |
 | `REAP_ON_SHUTDOWN` | `1` | destroy every instance and proxy when the instancer is asked to stop; `0` leaves them for the next start to adopt |
 | `LISTEN_PORT` | `5000` | port of the instancer web UI |
+| `CONFIG_FILE` | `config.yml` | path of the instancer's own config |
 | `SECRET_KEY` | random | signs the session cookies that carry instance ownership |
 | `PROXY_HOST` | unset | default proxy hostname shown to players (unset = the host serving the UI) |
 | `PROXY_TOKEN` | unset | the shared secret every proxy's own token is derived from |

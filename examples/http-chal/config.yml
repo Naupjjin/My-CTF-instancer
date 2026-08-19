@@ -1,0 +1,34 @@
+# This challenge, as players see it and as the instancer runs it. The directory
+# name (cookie-jar) is the id: it is in the URL, and in the name of every
+# container and network an instance of this challenge is made of.
+
+# The heading on the page.
+name: Cookie Jar
+author: naup
+type: web
+
+# How players reach it, and where. `http` gets a clickable link with the key
+# already in it; `netcat` gets an `nc host port` command and a key to paste.
+#
+# The proxy port is a real host port, and this challenge's proxy has it to
+# itself -- it is the one setting here that must not collide with another
+# challenge's.
+mode: http
+proxy_port: 1338
+
+# How long an instance of this challenge lives before the reaper destroys it,
+# in seconds. Nothing a player sends can ask for longer.
+ttl: 1800
+
+# Where an instance of this challenge lives: one /24 out of this pool, and one
+# port out of this range, both its own. A pool of its own, because address space
+# is real; a port range that may look like anyone else's, because an instance
+# port never leaves that instance's own network. The range is what decides how
+# many instances of this challenge can be up at once.
+subnet_pool: 10.241.0.0/16
+subnet_prefix: 24
+instance_ports: 30000-30100
+
+# Blast radius of one instance. Empty leaves the limit to Docker.
+mem_limit: 256m
+pids_limit: 128

@@ -3,7 +3,7 @@
 # image's default -- so a challenge that ignores $CHAL_PORT fails here, where you
 # are looking, instead of in front of players.
 #
-#   docker compose -f challenge/docker-compose.yml up --build
+#   docker compose -f examples/nc-chal/docker-compose.yml up --build
 #   nc localhost 30000
 services:
   pwn-special-love:

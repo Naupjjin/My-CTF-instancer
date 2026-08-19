@@ -1,37 +1,40 @@
 # SpawnZero
 
-A CTF instancer. One challenge, one button, one instance per browser session.
-Creating an instance hands out four things nobody else has:
+A CTF instancer. Many challenges, one service, one instance of each per browser
+session. Creating an instance hands out four things nobody else has:
 
 * a **container**,
 * a **subnet** — its own internal /24, with no gateway,
 * a **port** inside that subnet,
 * a **key**.
 
-Nothing is published to the host. The only way to an instance is the proxy: one
-container, one port, and a key that says which instance you get.
+Nothing is published to the host. The only way to an instance is its challenge's
+proxy: one container, one port, and a key that says which instance you get.
 
 ```
                     :5000  the web UI, hands out keys
-                    :1337  the proxy, the only way in
                       |
-   player  ───────────┴──────────►  [ proxy ]  ── key? ──►  [ instancer ]
-                                        │                    (docker.sock)
-              spawnzero-control 10.239.0.0/24  ────────────────────────┘
-                                        │
-              ┌─────────────────────────┼─────────────────────────┐
-              │ internal, no gateway    │ internal, no gateway    │
-        10.240.0.0/24              10.240.1.0/24            10.240.2.0/24
-        [ instance :30000 ]        [ instance :30001 ]      [ instance :30002 ]
+   player  ───────────┴───────────────────────────────►  [ instancer ]
+                                                           (docker.sock)
+            :1337  special-love          :1338  cookie-jar        │
+              │                            │                      │
+        [ proxy ] ── key? ──┐         [ proxy ] ── key? ───────────┤
+              │             └──────────────┼──────────────────────┘
+              │       ctf-control 10.239.0.0/24
+     ┌────────┴────────┐            ┌──────┴──────────┐
+     │ internal,       │            │ internal,       │
+     │ no gateway      │            │ no gateway      │
+  10.240.0.0/24   10.240.1.0/24  10.240.2.0/24   10.240.3.0/24
+  [ instance ]    [ instance ]   [ instance ]    [ instance ]
 ```
 
 ```
-challenge/            the challenge (Dockerfile + sources), built once at startup
-instancer-core/       the instancer: app.py + templates/index.html
-proxy-core/           the proxy: proxy.py (stdlib only)
+challenges/           one directory per challenge: Dockerfile + config.yml
+config.yml            the instancer's own name, and nothing else
+instancer-core/       the instancer: app.py + templates/
+proxy-core/           the proxy: proxy.py (stdlib only) + its Dockerfile
 Dockerfile.instancer  image for the instancer
-Dockerfile.proxy      image for the proxy
-docker-compose.yml    runs both, on the control network
+docker-compose.yml    runs the instancer; the proxies are its own doing
 tests/                unit tests (fake Docker, fake instances) + integration tests
 ```
 
@@ -41,27 +44,44 @@ tests/                unit tests (fake Docker, fake instances) + integration tes
 docker compose up --build
 ```
 
-Then open <http://localhost:5000>, press START, and you get an address and a key:
+Then open <http://localhost:5000>, pick a challenge, press START, and you get an
+address and a key:
 
 ```
 netcat   nc localhost 1337     then paste the key at the "key: " prompt
-http     http://localhost:1337/<key>/
+http     http://localhost:1338/<key>/
 ```
 
-At startup the instancer builds `challenge/` into `spawnzero-challenge:latest` and logs
-`challenge image built`. Instances are never rebuilt — START only runs a
-container from that image. **After editing the challenge, set `FORCE_BUILD=1`**:
-a stale image is reused silently, and one that predates the `CHAL_PORT` contract
-below will listen on the wrong port and never answer.
+Two challenges ship with it: `special-love`, a pwn service over raw TCP, and
+`cookie-jar`, a web challenge. They are also the worked examples of the two
+modes.
 
-To run it without Docker Compose (talks to your local Docker daemon, and needs
-the proxy container already running):
+At startup the instancer builds `proxy-core/` into `ctf-proxy:latest` and each
+`challenges/<id>/` into `ctf-challenge-<id>:latest`, then raises one proxy
+container per challenge. Instances are never rebuilt — START only runs a
+container from an image that is already there. **After editing a challenge, set
+`FORCE_BUILD=1`**: a stale image is reused silently, and one that predates the
+`CHAL_PORT` contract below will listen on the wrong port and never answer.
+
+## Adding a challenge
+
+Two things, and a restart:
 
 ```sh
-pip install -r instancer-core/requirements.txt
-CHALLENGE_DIR=./challenge PROXY_TOKEN=... python instancer-core/app.py
-PROXY_BIND=127.0.0.1 PROXY_TOKEN=... python proxy-core/proxy.py
+mkdir challenges/my-challenge          # the directory name is the id
+$EDITOR challenges/my-challenge/Dockerfile
+$EDITOR challenges/my-challenge/config.yml
+docker compose restart instancer
 ```
+
+Nothing else in the system is told that challenges exist — not
+`docker-compose.yml`, not the proxy, not the page. `examples/nc-chal/` is a
+directory to copy.
+
+The id has to be lowercase letters, digits and dashes: it goes in URLs and in the
+name of every container and network the challenge is made of. A challenge with no
+`Dockerfile`, no `config.yml`, or no `proxy_port` is skipped with a line in the
+log, and the others come up regardless — one broken challenge is not an outage.
 
 ## Cleaning up
 
@@ -69,88 +89,147 @@ PROXY_BIND=127.0.0.1 PROXY_TOKEN=... python proxy-core/proxy.py
 docker compose down
 ```
 
-takes the instances with it. Compose does not know about them — the instancer
-creates them at runtime over the Docker socket — so the instancer destroys them
-itself when it is asked to stop, along with their networks. `depends_on` puts it
-ahead of the proxy in the stop order, so the proxy is still around to be detached
-from each instance network on the way out, and `stop_grace_period: 60s` gives a
-full house time to come down.
+takes the instances *and the proxies* with it. Compose does not know about any of
+them — the instancer creates them at runtime over the Docker socket — so the
+instancer destroys them itself when it is asked to stop, along with the instance
+networks. Instances go first and proxies last, so each proxy is still there to be
+detached from the networks it is on, and `stop_grace_period: 60s` gives a full
+house time to come down.
 
 A *crash* is the other case, and there it deliberately does not happen: instances
-survive, and a restarted instancer re-adopts them from their labels instead of
-leaving players stranded. `REAP_ON_SHUTDOWN=0` extends that to deliberate stops
-too — worth setting mid-event if you want `docker compose restart` to be a
-non-event for players.
+survive, and a restarted instancer re-adopts them — and their proxies — from
+their labels instead of leaving players stranded. `REAP_ON_SHUTDOWN=0` extends
+that to deliberate stops too — worth setting mid-event if you want `docker
+compose restart` to be a non-event for players.
 
-If instances ever do outlive their instancer (it was killed, or the daemon
-restarted under it), they are labelled, so clearing them is exact:
+If any of it ever outlives its instancer (it was killed, or the daemon restarted
+under it), everything is labelled, so clearing it is exact:
 
 ```sh
-docker rm -f $(docker ps -aq --filter label=spawnzero.owner) 2>/dev/null
-docker network rm $(docker network ls -q --filter label=spawnzero.owner) 2>/dev/null
+docker rm -f $(docker ps -aq --filter label=ctf.chal) 2>/dev/null
+docker network rm $(docker network ls -q --filter label=ctf.chal) 2>/dev/null
 ```
 
-Take the stack down first: a network with the proxy still attached refuses to go
-with `has active endpoints`. Left alone, instances expire within `DEFAULT_TTL`
-anyway — but only while an instancer is running to reap them.
+Take the stack down first: a network with a proxy still attached refuses to go
+with `has active endpoints`. Left alone, instances expire within their
+challenge's `ttl` anyway — but only while an instancer is running to reap them.
 
 ## Configuration
 
-### Names — `config.yml`
+### The instancer — `config.yml`
 
 The one thing that is not an environment variable, because it is written rather
-than configured: what the page says.
+than configured: what the page calls this deployment.
 
 ```yaml
-chal_name: Special Love
-author: naup
-type: pwn
-
 instancer_name: SpawnZero
 ```
 
-`chal_name` is the heading, with `type` and `author` under it; `instancer_name`
-is the titlebar, the boot banner, and the first line the instancer logs on
+It is the titlebar, the boot banner, and the first line the instancer logs on
 startup. Nothing here changes how anything runs — a missing key falls back to a
-default, and a missing or broken file leaves the instancer running with
-placeholders and a complaint in the log rather than refusing to start. Unknown
+default, and a missing or broken file leaves the instancer running with a
+placeholder and a complaint in the log rather than refusing to start. Unknown
 keys are ignored out loud. Point `CONFIG_FILE` elsewhere to use another path.
 
-### Everything else — environment variables
+### A challenge — `challenges/<id>/config.yml`
+
+Everything about one challenge, next to its Dockerfile, because everything here
+is per challenge by nature: two challenges are two proxies on two ports, and a
+web app deserves a different ceiling than a pwn box.
+
+```yaml
+name: Special Love          # the heading; the id is used if it is missing
+author: naup
+type: pwn
+
+mode: netcat                # netcat | http -- how players reach it
+proxy_port: 1337            # the host port its proxy has to itself
+
+ttl: 3600                   # instance lifetime, seconds
+
+subnet_pool: 10.240.0.0/16  # where its instances live: one /24 each
+subnet_prefix: 24
+instance_ports: 30000-30100 # one port each, so: up to 101 at once
+
+mem_limit: 512m             # blast radius of one instance
+pids_limit: 256
+proxy_host:                 # optional: a hostname just for this challenge
+```
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `name` | the directory name | the heading on the challenge's page |
+| `author` | empty | shown under the heading |
+| `type` | empty | shown under the heading (`pwn`, `web`, …) |
+| `mode` | `http` | `http` shows a clickable link; `netcat` shows an `nc` command |
+| `proxy_port` | **required** | the host port this challenge's proxy answers on |
+| `ttl` | `3600` | instance lifetime in seconds — the same for every instance of it |
+| `subnet_pool` | `10.240.0.0/16` | the address space its instances are carved out of |
+| `subnet_prefix` | `24` | size of each instance's subnet (a /24 out of a /16 = 256 instances) |
+| `instance_ports` | `30000-30100` | the port range its instances draw from — and so how many can be up at once |
+| `mem_limit` | `512m` | memory ceiling per instance (empty = no limit) |
+| `pids_limit` | `256` | process ceiling per instance (empty or `0` = no limit) |
+| `proxy_host` | `PROXY_HOST` | proxy hostname shown to players (unset = the host serving the UI) |
+
+`proxy_port` is the one setting that must not collide with another challenge's:
+it is a real port on the host. Two challenges asking for the same one is caught
+at startup, and the second is refused with a line naming the first.
+
+The other two are worth understanding, because they look alike and are not:
+
+* **`subnet_pool` is real address space.** Give each challenge its own. Two
+  pointed at the same pool is allowed — every pick is checked against every
+  network on the daemon, so nothing is ever handed out twice — they just share
+  the space and run out sooner.
+* **`instance_ports` is not shared space at all.** An instance port exists only
+  inside that instance's own network namespace, so it collides with nothing on
+  the host and nothing in another challenge; two challenges can both hand out
+  `30000` and did, in a test. What the range really decides is **how many
+  instances of this challenge can be up at once** — one port each, so
+  `30000-30100` is 101. Write it as a range, or as a single port for a cap of
+  one.
+
+Between them, `subnet_pool` / `subnet_prefix` is the other ceiling: a /16 in /24s
+is 256 instances of that challenge. When either runs out, `POST
+/api/<chal>/create` returns `503` and starts nothing.
+
+### The deployment — environment variables
 
 Defaults in brackets. The instancer:
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `INSTANCE_PORT_MIN` | `30000` | first port an instance may be given |
-| `INSTANCE_PORT_MAX` | `30100` | last port an instance may be given |
-| `CHALLENGE_DIR` | `/challenge` | build context of the challenge |
-| `CHALLENGE_IMAGE` | `spawnzero-challenge:latest` | tag built at startup |
-| `FORCE_BUILD` | unset | rebuild the challenge image even if it exists |
+| `CHALLENGES_DIR` | `/challenges` | where the challenge directories are |
+| `CHALLENGE_IMAGE` | `ctf-challenge-{chal}:latest` | tag built for each challenge |
+| `PROXY_DIR` | `/proxy-core` | build context of the proxy image |
+| `PROXY_IMAGE` | `ctf-proxy:latest` | tag every proxy runs |
+| `FORCE_BUILD` | unset | rebuild the images even if they exist |
 | `PORT_ENV` | `CHAL_PORT` | the variable the instance's port is passed in |
-| `MODE` | `http` | `http` shows a clickable link; `netcat` shows an `nc` command |
-| `SUBNET_POOL` | `10.100.0.0/16` | pool the per-instance subnets are carved from |
-| `SUBNET_PREFIX` | `24` | size of each instance's subnet (a /24 = 256 subnets from a /16) |
-| `MEM_LIMIT` | `512m` | memory ceiling per instance (empty = no limit) |
-| `PIDS_LIMIT` | `256` | process ceiling per instance (empty or `0` = no limit) |
-| `DEFAULT_TTL` | `3600` | instance lifetime in seconds — the same for every instance |
+| `CONTROL_NETWORK` | `ctf-control` | the network the instancer and the proxies share |
+| `INSTANCER_URL` | `http://instancer:<LISTEN_PORT>` | where the proxies reach this process |
 | `CLEANUP_INTERVAL` | `10` | how often the background reaper checks for expiry (seconds) |
-| `REAP_ON_SHUTDOWN` | `1` | destroy every instance when the instancer is asked to stop; `0` leaves them for the next start to adopt |
+| `REAP_ON_SHUTDOWN` | `1` | destroy every instance and proxy when the instancer is asked to stop; `0` leaves them for the next start to adopt |
 | `LISTEN_PORT` | `5000` | port of the instancer web UI |
 | `SECRET_KEY` | random | signs the session cookies that carry instance ownership |
-| `PROXY_CONTAINER` | `spawnzero-proxy` | container the instancer attaches to every instance network |
-| `PROXY_PORT` | `1337` | proxy port shown to players |
-| `PROXY_HOST` | unset | proxy hostname shown to players (unset = the host serving the UI) |
-| `PROXY_TOKEN` | unset | shared secret the proxy presents when resolving a key |
+| `PROXY_HOST` | unset | default proxy hostname shown to players (unset = the host serving the UI) |
+| `PROXY_TOKEN` | unset | the shared secret every proxy's own token is derived from |
 
-And the proxy:
+Only five of these are written in `docker-compose.yml` — the two secrets, the UI
+port, the path of the instancer's own config, and `PROXY_HOST`. The rest have
+defaults that are already right for the compose layout, and nothing about a
+*challenge* is there at all: there is one environment and many challenges, so a
+per-challenge value has nowhere to live except with the challenge.
+
+And the proxy — all of it handed over by the instancer, which creates the
+container:
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `PROXY_BIND` | `0.0.0.0` | **the one address to answer on** — see below |
 | `PROXY_PORT` | `1337` | the single port players connect to |
+| `PROXY_CHAL` | unset | the challenge whose keys it may resolve, and no other |
 | `INSTANCER_URL` | `http://instancer:5000` | where keys are resolved |
-| `PROXY_TOKEN` | unset | must match the instancer's |
+| `PROXY_TOKEN` | unset | this challenge's token; must match what the instancer derives |
 | `MODE` | `http` | `http` reverse-proxies; `netcat` splices raw TCP |
 | `CONNECT_TIMEOUT` | `5` | seconds to reach the instancer or an instance |
 | `IDLE_TIMEOUT` | `300` | seconds a connection may sit silent |
@@ -161,18 +240,13 @@ every claim on a running container — is dropped when the instancer restarts.
 Set it (a `.env` file next to `docker-compose.yml` works) in anything but a
 throwaway run. Do the same for `PROXY_TOKEN`: the shipped default is a
 placeholder, and an unset one makes the instancer refuse *every* key lookup, so
-nobody gets through the proxy at all.
-
-How many instances can run at once is decided by the port range: one each, so
-`30000-30100` allows 101. These ports are not host ports — each lives inside its
-own instance's network namespace, so they collide with nothing on the machine.
-When the range runs out, `POST /create` fails with `no free instance port` and
-starts nothing.
+nobody gets through any proxy at all.
 
 ## Challenge requirements
 
-`challenge/` must contain a `Dockerfile` that builds a **self-contained** image
-(everything baked in — no volume mounts needed at runtime) which
+`challenges/<id>/` must contain a `config.yml` (above) and a `Dockerfile` that
+builds a **self-contained** image (everything baked in — no volume mounts needed
+at runtime) which
 
 * listens on `0.0.0.0:$CHAL_PORT` when started with no arguments,
 * needs no volumes, no extra capabilities, and no published port.
@@ -180,18 +254,20 @@ starts nothing.
 `CHAL_PORT` is the one contract: the instancer gives every instance a port of its
 own and passes it in as that variable. Bake a sensible default into the image
 (`ENV CHAL_PORT=...`) so it still runs by hand. A challenge that ignores the
-variable listens on the wrong port, and the proxy will report `502` / `no
+variable listens on the wrong port, and its proxy will report `502` / `no
 instance` for every player.
 
-The bundled challenge is a pwn service: `xinetd` serves a small binary over raw
-TCP. `xinetd` wants the port in a config file, so `entrypoint.sh` renders
-`xinetd.template` with `$CHAL_PORT` before starting it — the same two lines work
-for most servers that take a port on the command line.
+`challenges/special-love` is a pwn service: `xinetd` serves a small binary over
+raw TCP, and because `xinetd` wants the port in a config file, `entrypoint.sh`
+renders `xinetd.template` with `$CHAL_PORT` before starting it — the same two
+lines work for most servers that take a port on the command line.
+`challenges/cookie-jar` is a web challenge in the standard library, reading
+`CHAL_PORT` straight out of the environment.
 
-`challenge/docker-compose.yml` is for developing a challenge on its own:
+Each has a `docker-compose.yml` for developing it on its own:
 
 ```sh
-docker compose -f challenge/docker-compose.yml up --build
+docker compose -f challenges/special-love/docker-compose.yml up --build
 nc localhost 30000
 ```
 
@@ -200,10 +276,6 @@ the image's default, because that is how SpawnZero runs it. A challenge that
 ignores `$CHAL_PORT`, or that only works with your source bind-mounted over it,
 fails there instead of in front of players. SpawnZero itself never reads that
 file — it just `docker build`s the `Dockerfile`.
-
-Set `MODE` to how players reach it (`http` for web challenges, `netcat` for
-raw-TCP / pwn) — for both the instancer and the proxy. Nothing else is read: no
-manifest, no name, no config file.
 
 ## Isolation
 
@@ -220,50 +292,57 @@ eth0    0001F00A     00000000     <- its own /24, and nothing else
 ```
 
 No default route means no host, no `172.17.0.1`, no control network, no
-internet, no other instance — not filtered, *unroutable*. (Docker < 28 rejects
-the option; the instancer falls back to a plain internal network and logs a
-warning. That still blocks routing, but leaves the bridge's gateway address —
-i.e. the host — reachable from the instance. Upgrade.)
+internet, no other instance, and no instance of another challenge — not
+filtered, *unroutable*. (Docker < 28 rejects the option; the instancer falls back
+to a plain internal network and logs a warning. That still blocks routing, but
+leaves the bridge's gateway address — i.e. the host — reachable from the
+instance. Upgrade.)
 
-**The proxy is the one thing on that subnet, and it does not answer there.** The
-instancer attaches the proxy container to each instance network, so the proxy is
-multi-homed: it can dial the instance. The proxy binds `PROXY_BIND`, its address
-on the control network, and *never* `0.0.0.0` — a wildcard socket would also
-accept on every instance network it is later attached to, which would let a
-pwned instance connect to the proxy and ask for somebody else's key. Keep
-`PROXY_BIND` set to the proxy's control-network address; the proxy logs a
-warning if it is a wildcard.
+**The one thing on that subnet is the challenge's own proxy, and it does not
+answer there.** The instancer attaches a proxy container to each instance network
+of its own challenge, so the proxy is multi-homed: it can dial the instance. The
+proxy binds `PROXY_BIND`, the address the instancer picked for it on the control
+network, and *never* `0.0.0.0` — a wildcard socket would also accept on every
+instance network it is later attached to, which would let a pwned instance
+connect to the proxy and ask for somebody else's key. The instancer picks that
+address rather than letting the proxy guess which of its interfaces is the safe
+one; the proxy logs a warning if it is a wildcard anyway.
 
-**Nothing is published.** Instances get no host port at all, so the proxy is not
+**Nothing is published.** Instances get no host port at all, so a proxy is not
 just the intended path, it is the only one.
 
-**Keys are the only credential.** 16 random bytes, stored as a container label,
-compared in constant time, and only ever resolved for a *running* container.
-Destroy an instance and its key is dead. Turning a key into an address is the
-whole authority in the system, so `/internal/route/<key>` demands the shared
-`PROXY_TOKEN` and answers an indistinguishable `404` for a bad token, an unknown
-key, and a stopped instance alike.
+**Keys are the only credential, and they only work at one door.** 16 random
+bytes, stored as a container label, compared in constant time, and only ever
+resolved for a *running* container of the challenge that is asking. Destroy an
+instance and its key is dead. Turning a key into an address is the whole
+authority in this system, so `/internal/route/<chal>/<key>` demands a token —
+and each proxy has one of its own, `HMAC-SHA256(PROXY_TOKEN, <chal>)`, so a
+token taken off one proxy opens that challenge and no other. It is derived
+rather than stored, so it costs nothing to keep and survives a restart unchanged.
+A bad token, an unknown challenge, an unknown key and a stopped instance all get
+the same indistinguishable `404`.
 
-**Blast radius.** Each instance gets `MEM_LIMIT` and `PIDS_LIMIT` so one player's
-fork bomb is one player's problem. Capabilities are left alone on purpose: pwn
-challenges routinely need setuid helpers, and silently breaking them would be
-worse than the marginal hardening.
+**Blast radius.** Each instance gets its challenge's `mem_limit` and
+`pids_limit` so one player's fork bomb is one player's problem. Capabilities are
+left alone on purpose: pwn challenges routinely need setuid helpers, and silently
+breaking them would be worse than the marginal hardening.
 
 ## API
 
 A running instance is reported as
 
 ```json
-{"running": true, "mode": "netcat", "key": "9ce0…fea9", "proxy_host": null,
- "proxy_port": 1337, "expires_at": 1787020896, "remaining_time": 118}
+{"chal": "special-love", "name": "Special Love", "running": true,
+ "mode": "netcat", "key": "9ce0…fea9", "proxy_host": null, "proxy_port": 1337,
+ "expires_at": 1787020896, "remaining_time": 118}
 ```
 
-That is the whole of it: where to connect, the key, and how long you have.
-`proxy_host` is `null` unless `PROXY_HOST` is set, meaning "the host serving
-this page". The instance's own port, address, subnet and container name are
-never in a player-facing response — a player cannot route to any of it, so
-sending it would only describe our machinery. The proxy gets them, from
-`/internal/route/<key>`, which is the one route that does.
+That is the whole of it: which challenge, where to connect, the key, and how long
+you have. `proxy_host` is `null` unless it is set, meaning "the host serving this
+page". The instance's own port, address, subnet and container name are never in a
+player-facing response — a player cannot route to any of it, so sending it would
+only describe our machinery. The proxy gets them, from
+`/internal/route/<chal>/<key>`, which is the one route that does.
 
 Failures are the same story: the reason lands in the log, and the player gets
 something they can act on — `503` + "no free instance right now" when the port
@@ -273,43 +352,61 @@ the log.
 
 | Route | Response |
 | --- | --- |
-| `GET /` | the web UI |
-| `GET /status` | your instance, or `{"running": false, ...}` |
-| `POST /create` | your instance; returns the existing one if you already have it, `503`/`500` + `{"running": false, "error": ...}` on failure |
-| `POST /destroy` | `{"running": false, ...}`, also when you had nothing running |
-| `GET /internal/route/<key>` | `{"host": ..., "port": ...}` for the proxy; `404` without a matching `X-Proxy-Token` |
+| `GET /` | the challenge list |
+| `GET /c/<chal>` | one challenge's page; `404` for a challenge that is not served |
+| `GET /api/challenges` | every challenge, and whether you have one running |
+| `GET /api/<chal>/status` | your instance of it, or `{"running": false, ...}` |
+| `POST /api/<chal>/create` | your instance; returns the existing one if you already have it, `503`/`500` + `{"running": false, "error": ...}` on failure |
+| `POST /api/<chal>/destroy` | `{"running": false, ...}`, also when you had nothing running |
+| `GET /internal/route/<chal>/<key>` | `{"host": ..., "port": ...}` for that challenge's proxy; `404` without its `X-Proxy-Token` |
 
-`POST /create` takes no parameters. Instance lifetime is `DEFAULT_TTL` and only
-`DEFAULT_TTL`: a request cannot ask for a longer one, so a body is ignored, and
-the only way to change a lifetime is to restart the instancer with a different
-value.
+`POST /api/<chal>/create` takes no parameters. Instance lifetime is the
+challenge's `ttl` and only that: a request cannot ask for a longer one, so a body
+is ignored, and the only way to change a lifetime is to edit the challenge's
+config.yml and restart.
 
-Every player-facing route only ever talks about the caller's own instance.
-`GET /` puts a random id in a Flask session cookie — minted there rather than in
-`/create`, so two fast clicks on START cannot race into two identities. That id
-names both the container (`spawnzero-instance-<id>`) and the network
-(`spawnzero-network-<id>`). Somebody else's `/status` reports nothing and their
-`/destroy` removes nothing. Users never send an image, port, subnet, command, or
-anything else Docker acts on.
+Every player-facing route only ever talks about the caller's own instance of the
+challenge named in the path. `GET /` puts a random id in a Flask session cookie —
+minted there rather than in `/create`, so two fast clicks on START cannot race
+into two identities. That id and the challenge id together name both the
+container (`ctf-instance-<chal>-<id>`) and the network
+(`ctf-network-<chal>-<id>`), so one browser holds at most one instance of each
+challenge. Somebody else's `/status` reports nothing and their `/destroy` removes
+nothing. Users never send an image, port, subnet, command, or anything else
+Docker acts on.
 
 ## How it works
 
-**Create.** Under a `threading.Lock` (so concurrent clicks can't double-create),
-the instancer picks a free port, a free `/24` out of `SUBNET_POOL`, and a fresh
-key; creates `spawnzero-network-<id>` as an internal, gatewayless bridge; attaches the
-proxy to it; then creates and starts `spawnzero-instance-<id>` on it with the port in
-`$CHAL_PORT`. If anything fails — including the proxy being missing — the
-half-built container and network are torn down before returning `500`, so the
-port, subnet and key stay free.
+**Startup.** The instancer reads `challenges/`, one directory at a time, and
+holds each one that has a Dockerfile, a config.yml and a port nobody else claimed.
+It builds the proxy image and one image per challenge (only if missing), removes
+any proxy whose challenge is no longer there — before raising the others, because
+a departed challenge's proxy is still holding its published port — and then gives
+every challenge a proxy: a container on the control network, with one address of
+its own to bind, the host port its config.yml asked for, and a token derived for
+it alone. A proxy that is already running the config it should be is adopted
+untouched, so restarting the instancer does not interrupt anyone mid-connection;
+one running the *previous* config.yml is replaced. A challenge that will not
+build, or cannot get a proxy, is dropped with a line in the log while the rest
+come up.
 
-**Connect.** The player sends the key to the proxy: as the first line in netcat
-mode, or as the first path segment (`/<key>/…`) in http mode, where the answer
-also carries a `sz_key` cookie so the challenge's own absolute links keep
-routing. The proxy asks the instancer where that key leads, opens a connection to
-`<instance ip>:<instance port>`, and splices the two together. It keeps no
-routing table of its own, so a destroyed instance is unreachable immediately. In
-http mode each exchange gets its own upstream connection (`Connection: close`),
-because keep-alive would let a second request ride in on the first request's key.
+**Create.** Under two locks (below), the instancer picks a free port for that
+challenge, a free `/24` out of that challenge's `subnet_pool`, and a fresh key; creates
+`ctf-network-<chal>-<id>` as an internal, gatewayless bridge; attaches *that
+challenge's* proxy to it; then creates and starts `ctf-instance-<chal>-<id>` on
+it with the port in `$CHAL_PORT`. If anything fails — including the proxy being
+missing — the half-built container and network are torn down before returning
+`500`, so the port, subnet and key stay free.
+
+**Connect.** The player sends the key to the challenge's proxy: as the first line
+in netcat mode, or as the first path segment (`/<key>/…`) in http mode, where the
+answer also carries a `sz_key` cookie so the challenge's own absolute links keep
+routing. The proxy asks the instancer where that key leads *for its own
+challenge*, opens a connection to `<instance ip>:<instance port>`, and splices the
+two together. It keeps no routing table of its own, so a destroyed instance is
+unreachable immediately. In http mode each exchange gets its own upstream
+connection (`Connection: close`), because keep-alive would let a second request
+ride in on the first request's key.
 
 **A crowd.** Everything that can be handed out twice is handed out under a lock,
 and everything slow happens outside one. Two levels:
@@ -320,10 +417,11 @@ and everything slow happens outside one. Two levels:
   container exists — a second or two later, and two players would be handed the
   same port in that gap. The reservation is dropped in a `finally`, whether the
   build worked or not.
-* An **owner lock**, one per session (striped, so the set is fixed rather than
-  growing with every session an event sees), covers everything that touches a
-  single instance: create, destroy, the stale-container sweep in `/status`, and
-  the reaper. Two requests about the same instance queue up instead of fighting.
+* An **owner lock**, one per session per challenge (striped, so the set is fixed
+  rather than growing with every session an event sees), covers everything that
+  touches a single instance: create, destroy, the stale-container sweep in
+  `/status`, and the reaper. Two requests about the same instance queue up instead
+  of fighting.
 
 That second lock is not decoration. `/status` *deletes* a container it finds not
 running, and "not running yet" is exactly what a container looks like between
@@ -334,33 +432,41 @@ network looks like. Both are covered by tests that fail if the locking is
 removed.
 
 Because the pool lock is never held while Docker works, creates overlap: twelve
-sessions pressing START at once finish in about three and a half seconds
-against a real daemon, all twelve with their own port, subnet, key and network.
-When the pools do run out, the extra players get `503` and nothing half-built is
-left behind — they are turned away, never double-booked.
+sessions pressing START at once finish in a few seconds against a real daemon,
+all twelve with their own port, subnet, key and network. When the pools do run
+out, the extra players get `503` and nothing half-built is left behind — they are
+turned away, never double-booked.
 
 The reservations live in this process, so run one instancer process. Threads are
 fine (the dev server is threaded, which is what all of the above is for); several
 worker *processes* would each keep their own reservation set and could hand out
 the same port twice.
 
-**TTL.** `expires_at = now + DEFAULT_TTL` is stamped on the container as a label. A
-background thread wakes every `CLEANUP_INTERVAL` seconds and destroys any
-instance past its `expires_at` (container **and** network), and prunes any
-`spawnzero-network-*` whose container is gone. Removing a network means detaching the
-proxy first — Docker refuses to remove a network that still has an endpoint.
+**TTL.** `expires_at = now + ttl`, the challenge's own, is stamped on the
+container as a label. A background thread wakes every `CLEANUP_INTERVAL` seconds
+and destroys any instance past its `expires_at` (container **and** network), and
+prunes any `ctf-network-*` whose container is gone. It works off labels rather
+than off the loaded config, so instances of a challenge taken off disk mid-event
+still expire on schedule instead of living forever. Removing a network means
+detaching the proxy first — Docker refuses to remove a network that still has an
+endpoint.
 
 **Persistence.** Docker is the only state store — there is no database. All
-metadata lives in labels (`spawnzero.owner`, `spawnzero.expires_at`, `spawnzero.subnet`,
-`spawnzero.port`, `spawnzero.key`) on the container and network, so restarting the instancer
-re-discovers running instances, their TTLs *and* their keys instead of
-duplicating them. The proxy is stateless for the same reason: it re-reads every
-key from the instancer. Reconnecting a *browser* to its instance across a restart
-additionally needs a stable `SECRET_KEY`.
+metadata lives in labels (`ctf.chal`, `ctf.owner`, `ctf.expires_at`,
+`ctf.subnet`, `ctf.port`, `ctf.key` on instances; `ctf.chal` and
+`ctf.proxy_spec` on proxies) on the container and network, so restarting the
+instancer re-discovers running instances, their TTLs *and* their keys instead of
+duplicating them, and can tell an adoptable proxy from a stale one. The proxies
+are stateless for the same reason: each re-reads every key from the instancer.
+Reconnecting a *browser* to its instances across a restart additionally needs a
+stable `SECRET_KEY`.
 
-**Recycling.** Nothing is tracked in memory: `pick_port()` reads the ports of
-live instances and `pick_subnet()` the subnets of live networks, so a destroyed
-or reaped instance's port and /24 are free again the moment it is gone.
+**Recycling.** Nothing is tracked in memory: `pick_port()` reads the ports of one
+challenge's live instances and walks that challenge's own range, and
+`pick_subnet()` walks that challenge's own pool while checking against the
+subnets of *every* live network — so a destroyed or reaped instance's port and
+/24 are free again the moment it is gone, and two challenges sharing a pool
+still cannot be handed the same one.
 
 ## Tests
 
@@ -370,12 +476,14 @@ python -m pytest tests -rs
 ```
 
 `tests/test_instancer.py` runs against a fake Docker daemon (no Docker needed);
-two Flask test clients stand in for two users, and two tests pin down exactly
-what a player is and is not told. `tests/test_proxy.py` runs the
-real proxy over real sockets against fake instances — key handling, path/cookie
-routing, hangups, and the parsing helpers. `tests/test_docker_integration.py`
-builds the real challenge and proxy images and drives real containers and
-networks: a key really carries a player through the proxy to the pwn service, a
-destroyed instance's key really stops working, and an instance really cannot
-reach the proxy, the control network, or a default route. It skips itself when
-no Docker daemon is reachable.
+two Flask test clients stand in for two users, two challenges stand in for an
+event, and a handful of tests pin down exactly what a player is and is not told.
+`tests/test_proxy.py` runs the real proxy over real sockets against fake
+instances — key handling, path/cookie routing, hangups, and the parsing helpers.
+`tests/test_docker_integration.py` builds the real proxy and both real challenge
+images and drives real containers, networks and proxies: a key really carries a
+player through a proxy to the pwn service and through another to the web app, a
+key really does nothing at the other challenge's door, a destroyed instance's key
+really stops working, and an instance really cannot reach a proxy, the control
+network, a default route, or anybody else's instance. It skips itself when no
+Docker daemon is reachable, or when the ports it wants are taken.

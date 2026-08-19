@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}{{ instancer_name }}{% endblock %}</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&family=VT323&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --paper:   #e9e7f1;   /* page: cool pale lavender-grey */
+    --card:    #fcfbff;   /* panel */
+    --ink:     #4b485e;   /* text + borders: soft slate-violet */
+    --ink-dim: #918fa6;   /* secondary text */
+    --accent:  #8a7fc7;   /* periwinkle (primary) */
+    --accent-s:#dad4f0;   /* pale periwinkle (shadows/fills) */
+    --sage:    #6fb39a;   /* online */
+    --sage-s:  #d3ebe0;
+    --rose:    #d98c9b;   /* offline / stop / critical */
+    --rose-s:  #f2dae0;
+    --amber:   #c6a15e;   /* warning */
+  }
+
+  * { box-sizing: border-box; }
+  html, body { min-height: 100%; }
+
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: 'VT323', ui-monospace, 'Courier New', monospace;
+    font-size: 22px;
+    line-height: 1.35;
+    display: flex;
+    padding: 24px;
+    -webkit-font-smoothing: none;   /* keep type crisp / pixel-ish */
+  }
+  .pixel { font-family: 'Press Start 2P', 'VT323', ui-monospace, monospace; }
+
+  /* soft retro texture: faint dither + faint scanlines, no harsh glow */
+  body::before {
+    content: ""; position: fixed; inset: 0; z-index: 40; pointer-events: none; opacity: .5;
+    background:
+      repeating-linear-gradient(0deg, rgba(75,72,94,.05) 0 1px, transparent 1px 3px),
+      repeating-conic-gradient(from 0deg, rgba(75,72,94,.04) 0% 25%, transparent 0% 50%) 0 0 / 4px 4px;
+  }
+  body::after {                        /* very gentle vignette in paper tone */
+    content: ""; position: fixed; inset: 0; z-index: 41; pointer-events: none;
+    background: radial-gradient(120% 120% at 50% 40%, transparent 60%, rgba(75,72,94,.08) 100%);
+  }
+
+  /* ---- panel ---- */
+  #frame {
+    position: relative; z-index: 10; margin: auto;   /* centres, never clips */
+    width: min(560px, 100%);
+    background: var(--card);
+    border: 3px solid var(--ink);
+    box-shadow: 8px 8px 0 var(--accent-s), 0 0 0 1px var(--card) inset;
+  }
+  #titlebar {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 10px 12px;
+    border-bottom: 3px solid var(--ink);
+    background: repeating-linear-gradient(90deg, var(--card) 0 8px, #f4f2fb 8px 16px);
+  }
+  .brand { font-size: 12px; color: var(--ink); text-decoration: none; }
+  .dots { display: flex; gap: 6px; }
+  .dots i { width: 11px; height: 11px; display: block; border: 2px solid var(--ink); }
+  .dots i.s { background: var(--sage);   }
+  .dots i.a { background: var(--accent); }
+  .dots i.r { background: var(--rose);   }
+
+  #screen { padding: 22px 22px 24px; min-height: 250px; }
+
+  #boot { white-space: pre-wrap; color: var(--ink-dim); min-height: 96px; font-size: 20px; }
+  #boot b { color: var(--accent); }
+
+  #console { opacity: 0; transition: opacity .25s steps(4); }
+  #console.on { opacity: 1; }
+
+  h1.pixel { font-size: 19px; margin: 2px 0 7px; color: var(--ink); letter-spacing: 1px; }
+  .sub { margin: 0 0 20px; }
+  .sub .tag { color: var(--accent); text-transform: uppercase; letter-spacing: 1px; }
+
+  .row { display: flex; align-items: baseline; gap: 12px; margin: 9px 0; flex-wrap: wrap; }
+  .lbl { color: var(--accent); font-size: 11px; min-width: 92px; }
+
+  .led { width: 13px; height: 13px; display: inline-block; border: 2px solid var(--ink);
+         background: var(--rose); flex: none; }
+  .led.on { background: var(--sage); animation: blink 1.2s steps(1) infinite; }
+  @keyframes blink { 50% { opacity: .35; } }
+
+  #state { font-size: 11px; color: var(--rose); }
+  #state.online { color: var(--sage); }
+
+  .copy { color: var(--ink); text-decoration: none; word-break: break-all;
+          border-bottom: 2px dotted var(--accent); cursor: pointer; padding: 0 2px; }
+  .copy:hover { background: var(--accent-s); }
+  .prompt { color: var(--accent); }
+  .cursor { display: inline-block; width: 9px; height: 17px; background: var(--ink);
+            vertical-align: -3px; margin-left: 2px; animation: blink .9s steps(1) infinite; }
+
+  .clock { font-size: 30px; letter-spacing: 2px; color: var(--ink); }
+  .clock.warn { color: var(--amber); }
+  .clock.crit { color: var(--rose); animation: blink .7s steps(1) infinite; }
+
+  .muted { color: var(--ink-dim); font-size: 16px; }
+
+  /* ---- the challenge list ---- */
+  .list { display: flex; flex-direction: column; gap: 0; margin: 4px 0 0;
+          border-top: 2px dotted var(--accent-s); }
+  .chal {
+    display: flex; align-items: center; gap: 12px; padding: 11px 4px;
+    border-bottom: 2px dotted var(--accent-s); text-decoration: none; color: var(--ink);
+  }
+  .chal:hover { background: var(--accent-s); }
+  .chal .name { flex: 1; min-width: 0; }
+  .chal .type { font-size: 10px; color: var(--accent); text-transform: uppercase;
+                letter-spacing: 1px; }
+  .chal .when { font-size: 16px; color: var(--ink-dim); min-width: 66px; text-align: right; }
+  .chal .when.on { color: var(--sage); }
+  .empty { color: var(--ink-dim); }
+
+  /* ---- buttons: pale pixel blocks ---- */
+  #actions { margin-top: 24px; display: flex; gap: 14px; }
+  .btn {
+    display: inline-flex; align-items: center; gap: 10px;
+    font-family: 'Press Start 2P', monospace; font-size: 11px;
+    color: var(--ink); background: var(--card);
+    border: 3px solid var(--ink); padding: 13px 16px;
+    cursor: pointer; text-transform: uppercase; letter-spacing: 1px;
+    box-shadow: 4px 4px 0 var(--accent-s);
+  }
+  .btn .ico { width: 11px; height: 11px; display: inline-block; border: 2px solid var(--ink); background: var(--accent); }
+  .btn:hover { background: var(--accent); color: var(--card); box-shadow: 4px 4px 0 var(--ink); }
+  .btn:hover .ico { background: var(--card); }
+  .btn:active { transform: translate(4px,4px); box-shadow: 0 0 0; }
+  .btn:disabled { opacity: .4; cursor: not-allowed; box-shadow: 4px 4px 0 #e6e4ee; }
+  .btn.danger { border-color: var(--rose); color: var(--rose); box-shadow: 4px 4px 0 var(--rose-s); }
+  .btn.danger .ico { border-color: var(--rose); background: var(--rose); }
+  .btn.danger:hover { background: var(--rose); color: var(--card); box-shadow: 4px 4px 0 var(--ink); }
+  .btn.danger:hover .ico { background: var(--card); }
+
+  .back { display: inline-block; margin-top: 22px; font-size: 11px; color: var(--accent);
+          text-decoration: none; }
+  .back:hover { text-decoration: underline; }
+
+  #error { color: var(--rose); font-size: 16px; margin-top: 14px; min-height: 20px; }
+  #error:not(:empty)::before { content: ":: "; }
+
+  /* gentle glitch on the wordmark only, in soft accents */
+  .glitch { position: relative; }
+  .glitch::before, .glitch::after {
+    content: attr(data-text); position: absolute; left: 0; top: 0; width: 100%; overflow: hidden;
+  }
+  .glitch::before { color: var(--accent); transform: translate(-1px,0); animation: gb 4s infinite steps(2); opacity: .5; }
+  .glitch::after  { color: var(--sage);   transform: translate(1px,0);  animation: gr 5s infinite steps(2); opacity: .5; }
+  @keyframes gb { 0%,94%,100%{clip-path:inset(0 0 100% 0)} 95%{clip-path:inset(15% 0 55% 0)} 98%{clip-path:inset(45% 0 25% 0)} }
+  @keyframes gr { 0%,93%,100%{clip-path:inset(100% 0 0 0)} 96%{clip-path:inset(60% 0 20% 0)} }
+
+  @media (prefers-reduced-motion: reduce) {
+    .led.on, .glitch::before, .glitch::after, .clock.crit { animation: none; }
+  }
+</style>
+</head>
+<body>
+<div id="frame">
+  <div id="titlebar">
+    <a class="brand pixel glitch" href="/" data-text="{{ instancer_name|upper }}">{{ instancer_name|upper }}</a>
+    <span class="dots"><i class="s"></i><i class="a"></i><i class="r"></i></span>
+  </div>
+
+  <div id="screen">
+{% block screen %}{% endblock %}
+  </div>
+</div>
+{% block script %}{% endblock %}
+</body>
+</html>

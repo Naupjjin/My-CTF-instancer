@@ -1,0 +1,170 @@
+{% extends "base.html" %}
+{% block title %}{{ chal.name }} // {{ instancer_name }}{% endblock %}
+
+{% block screen %}
+    <div id="console" class="on">
+      <h1 class="pixel">{{ chal.name|upper }}</h1>
+      {% if chal.type or chal.author %}
+      <div class="sub muted">
+        {%- if chal.type %}<span class="tag">{{ chal.type }}</span>{% endif -%}
+        {%- if chal.type and chal.author %} // {% endif -%}
+        {%- if chal.author %}by {{ chal.author }}{% endif -%}
+      </div>
+      {% endif %}
+
+      <div class="row">
+        <span class="lbl pixel">STATUS</span>
+        <span id="led" class="led"></span>
+        <span id="state" class="pixel">OFFLINE</span>
+      </div>
+
+      <div class="row" id="addr-row" hidden>
+        <span class="lbl pixel">ADDR</span>
+        <span><span class="prompt">&gt;</span> <a id="address" class="copy"></a></span>
+      </div>
+
+      <div class="row" id="key-row" hidden>
+        <span class="lbl pixel">KEY</span>
+        <span><span class="prompt">&gt;</span> <a id="key" class="copy"></a></span>
+      </div>
+
+      <div class="row" id="hint-row" hidden>
+        <span class="lbl pixel"></span>
+        <span class="muted" id="hint"></span>
+      </div>
+
+      <div class="row" id="ttl-row" hidden>
+        <span class="lbl pixel">EXPIRES</span>
+        <span id="remaining" class="clock">--:--</span>
+      </div>
+
+      <div class="row">
+        <span class="lbl pixel">LIFETIME</span>
+        <span class="muted"><span id="ttlcfg">--</span>s per instance</span>
+      </div>
+
+      <div id="actions">
+        <button id="start" class="btn" hidden><i class="ico"></i>START</button>
+        <button id="stop" class="btn danger" hidden><i class="ico"></i>STOP</button>
+      </div>
+
+      <div id="error"></div>
+      <a class="back pixel" href="/">&lt; back to the list</a>
+    </div>
+{% endblock %}
+
+{% block script %}
+<script>
+// Injected by Flask. The instance lifetime and the proxy address are this
+// challenge's own (challenges/{{ chal.id }}/config.yml); an empty PROXY_HOST
+// means "the host serving this page".
+const CHAL = {{ chal.id|tojson }};
+const MODE = {{ chal.mode|tojson }};
+const TTL = {{ chal.ttl }};
+const PROXY_HOST = {{ (chal.proxy_host or None)|tojson }};
+const PROXY_PORT = {{ chal.proxy_port }};
+
+const led = document.getElementById("led");
+const state = document.getElementById("state");
+const addrRow = document.getElementById("addr-row");
+const address = document.getElementById("address");
+const keyRow = document.getElementById("key-row");
+const key = document.getElementById("key");
+const hintRow = document.getElementById("hint-row");
+const hint = document.getElementById("hint");
+const ttlRow = document.getElementById("ttl-row");
+const remaining = document.getElementById("remaining");
+const ttlcfg = document.getElementById("ttlcfg");
+const start = document.getElementById("start");
+const stop = document.getElementById("stop");
+const error = document.getElementById("error");
+
+ttlcfg.textContent = TTL;
+let countdown = null;
+
+/* ---------- rendering ---------- */
+function formatAddress(mode, host, port, key) {
+  // Everything goes through this challenge's one proxy port; the key says which
+  // instance behind it is yours.
+  if (mode === "netcat") return { text: "nc " + host + " " + port, href: null };
+  const url = "http://" + host + ":" + port + "/" + key + "/";
+  return { text: url, href: url };
+}
+const HINTS = {
+  netcat: "connect, then paste the key at the prompt",
+  http:   "the link carries the key; a cookie keeps it after that",
+};
+function fmt(sec) {
+  sec = Math.max(0, sec);
+  const m = Math.floor(sec / 60), s = sec % 60;
+  return String(m).padStart(2, "0") + ":" + String(s).padStart(2, "0");
+}
+function runClock(sec) {
+  if (countdown) clearInterval(countdown);
+  let left = sec;
+  const tick = () => {
+    remaining.textContent = fmt(left);
+    remaining.className = "clock" + (left <= 10 ? " crit" : left <= 60 ? " warn" : "");
+    if (left <= 0) { clearInterval(countdown); refresh(); }
+    left -= 1;
+  };
+  tick();
+  countdown = setInterval(tick, 1000);
+}
+function render(data) {
+  if (data.running) {
+    const mode = data.mode || MODE;
+    const host = data.proxy_host || location.hostname;
+    const a = formatAddress(mode, host, data.proxy_port || PROXY_PORT, data.key);
+    led.classList.add("on");
+    state.textContent = "ONLINE"; state.classList.add("online");
+    address.textContent = a.text;
+    if (a.href) { address.href = a.href; address.target = "_blank"; }
+    else { address.removeAttribute("href"); address.title = "click to copy"; }
+    key.textContent = data.key || "";
+    key.title = "click to copy";
+    hint.textContent = HINTS[mode] || "";
+    addrRow.hidden = false; keyRow.hidden = false; hintRow.hidden = false;
+    if (typeof data.remaining_time === "number") { ttlRow.hidden = false; runClock(data.remaining_time); }
+    start.hidden = true; stop.hidden = false;
+  } else {
+    if (countdown) { clearInterval(countdown); countdown = null; }
+    led.classList.remove("on");
+    state.textContent = "OFFLINE"; state.classList.remove("online");
+    addrRow.hidden = true; keyRow.hidden = true; hintRow.hidden = true;
+    ttlRow.hidden = true;
+    start.hidden = false; stop.hidden = true;
+  }
+}
+
+/* ---------- API ---------- */
+async function call(path, method) {
+  start.disabled = stop.disabled = true;
+  error.textContent = "";
+  try {
+    const r = await fetch("/api/" + encodeURIComponent(CHAL) + path, { method });
+    const data = await r.json();
+    if (data.error) error.textContent = data.error;
+    render(data);
+  } catch (e) { error.textContent = String(e); }
+  start.disabled = stop.disabled = false;
+}
+const refresh = () => call("/status", "GET");
+start.onclick = () => call("/create", "POST");   // lifetime is this challenge's ttl
+stop.onclick  = () => call("/destroy", "POST");
+
+// click a copyable field (the netcat address, the key) to put it on the clipboard
+document.querySelectorAll(".copy").forEach((el) => {
+  el.addEventListener("click", (e) => {
+    if (el.hasAttribute("href")) return;   // a real link: let it open
+    e.preventDefault();
+    navigator.clipboard && navigator.clipboard.writeText(el.textContent);
+    const old = el.textContent; el.textContent = "[COPIED]";
+    setTimeout(() => { el.textContent = old; }, 700);
+  });
+});
+
+/* ---------- go ---------- */
+refresh();
+</script>
+{% endblock %}

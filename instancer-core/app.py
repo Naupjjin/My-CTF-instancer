@@ -1,7 +1,14 @@
-"""SpawnZero: a minimal CTF instancer.
+"""A CTF instancer: many challenges, one service.
 
-One challenge, one instance per browser session. Creating an instance hands out
-four things that belong to nobody else:
+A challenge is a directory under CHALLENGES_DIR with a config.yml next to its
+Dockerfile, and that is the whole of what the instancer knows about it. Each one
+gets:
+
+  * an image, built once,
+  * a proxy container of its own -- one published port, and the only door in,
+  * and, per player, an instance.
+
+An instance is four things that belong to nobody else:
 
   * a container,
   * a /24 bridge network -- internal, and without a gateway address, so the
@@ -9,15 +16,18 @@ four things that belong to nobody else:
   * a port inside that network,
   * a key.
 
-Nothing is published to the host: the only way to an instance is the proxy
-(proxy-core/proxy.py), which trades a key for an address. All state lives in
-Docker itself -- container/network names and labels -- so a restart of this
+Nothing is published to the host: the only way to an instance is its challenge's
+proxy (proxy-core/proxy.py), which trades a key for an address. All state lives
+in Docker itself -- container/network names and labels -- so a restart of this
 process re-discovers everything instead of duplicating it.
 """
 
+import hashlib
+import hmac
 import ipaddress
 import logging
 import os
+import re
 import secrets
 import signal
 import sys
@@ -29,45 +39,71 @@ import yaml
 from docker.errors import APIError, DockerException, ImageNotFound, NotFound
 from flask import Flask, jsonify, render_template, request, session
 
-# The port an instance listens on, inside its own network. Never published, so
-# the range only has to be big enough for the instances running at once -- it
-# cannot collide with anything on the host.
-INSTANCE_PORT_MIN = int(os.environ.get("INSTANCE_PORT_MIN", "30000"))
-INSTANCE_PORT_MAX = int(os.environ.get("INSTANCE_PORT_MAX", "30100"))
-
-CHALLENGE_DIR = os.environ.get("CHALLENGE_DIR", "/challenge")
-CHALLENGE_IMAGE = os.environ.get("CHALLENGE_IMAGE", "spawnzero-challenge:latest")
+# Where the challenges are, one directory each. The directory name is the
+# challenge id: it is in the URL, and in the name of everything the challenge is
+# made of, so it is held to a shape.
+CHALLENGES_DIR = os.environ.get("CHALLENGES_DIR", "/challenges")
+CHALLENGE_CONFIG = "config.yml"
+CHALLENGE_IMAGE = os.environ.get("CHALLENGE_IMAGE", "ctf-challenge-{chal}:latest")
+CHALLENGE_ID = re.compile(r"\A[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?\Z")
 FORCE_BUILD = os.environ.get("FORCE_BUILD", "").lower() in ("1", "true", "yes")
+
+# The proxy image is ours too, and built the same way -- the instancer creates
+# the proxies, so nothing outside this process needs to know how many there are.
+PROXY_DIR = os.environ.get("PROXY_DIR", "/proxy-core")
+PROXY_IMAGE = os.environ.get("PROXY_IMAGE", "ctf-proxy:latest")
+
 LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "5000"))
 SECRET_KEY = os.environ.get("SECRET_KEY")
-CONTAINER_PREFIX = "spawnzero-instance-"
-NETWORK_PREFIX = "spawnzero-network-"
 
-# The proxy: one container, one published port, attached to every instance
-# network by us. PROXY_HOST is only needed when players reach the proxy under a
-# different name than the instancer -- empty means "same host as this page".
-PROXY_CONTAINER = os.environ.get("PROXY_CONTAINER", "spawnzero-proxy")
+# One instancer, many challenges, so a name has to say which. Every object
+# carries the challenge it belongs to and the session that owns it.
+CONTAINER_PREFIX = "ctf-instance-"
+NETWORK_PREFIX = "ctf-network-"
+PROXY_PREFIX = "ctf-proxy-"
+CONTAINER_NAME = CONTAINER_PREFIX + "{chal}-{owner}"
+NETWORK_NAME = NETWORK_PREFIX + "{chal}-{owner}"
+PROXY_NAME = PROXY_PREFIX + "{chal}"
+
+# The network the instancer and every proxy share. Instances are never on it;
+# each proxy is given one address here and binds only that.
+CONTROL_NETWORK = os.environ.get("CONTROL_NETWORK", "ctf-control")
+INSTANCER_URL = os.environ.get("INSTANCER_URL", "http://instancer:%d" % LISTEN_PORT)
+
+# Leave the low addresses of the control network to whatever compose brings up.
+PROXY_ADDRESS_OFFSET = 10
+
+# Where players reach the proxies, when that is not the host serving this page.
+# A challenge may override it; most never do.
 PROXY_HOST = os.environ.get("PROXY_HOST", "")
-PROXY_PORT = int(os.environ.get("PROXY_PORT", "1337"))
+
+# The one secret shared with the proxies. Each proxy is handed a token of its
+# own, derived from this, so a token taken off one proxy opens nothing but that
+# challenge -- and none of them has to be stored anywhere.
 PROXY_TOKEN = os.environ.get("PROXY_TOKEN", "")
 
 # Keys are what a player sends to the proxy, so they are the only credential in
 # the system: long enough not to be guessed, short enough to paste.
-KEY_BYTES = int(os.environ.get("KEY_BYTES", "16"))
+KEY_BYTES = 16
 
-# The environment variable that tells the challenge which port to listen on.
+# The environment variable that tells a challenge which port to listen on.
 PORT_ENV = os.environ.get("PORT_ENV", "CHAL_PORT")
 
-# The one thing that is not an environment variable: the names on the page.
+# The instancer's own name, the one thing that is written rather than configured.
 CONFIG_FILE = os.environ.get("CONFIG_FILE", "config.yml")
 
-# Blast radius of one instance. Empty or 0 leaves the limit to Docker.
-MEM_LIMIT = os.environ.get("MEM_LIMIT", "512m")
-PIDS_LIMIT = int(os.environ.get("PIDS_LIMIT", "256") or 0)
-
-# One /24 per instance, carved out of this pool.
-SUBNET_POOL = ipaddress.ip_network(os.environ.get("SUBNET_POOL", "10.100.0.0/16"))
-SUBNET_PREFIX = int(os.environ.get("SUBNET_PREFIX", "24"))
+# What a challenge gets when its config.yml does not say. Where an instance
+# lives is the challenge's business now -- its own pool and its own port range,
+# written next to its Dockerfile -- so these are only the shape of a sensible
+# answer, not knobs: there is nowhere in the environment for a per-challenge one.
+DEFAULT_TTL = 3600
+DEFAULT_MEM_LIMIT = "512m"
+DEFAULT_PIDS_LIMIT = 256
+DEFAULT_SUBNET_POOL = "10.240.0.0/16"
+DEFAULT_SUBNET_PREFIX = 24
+DEFAULT_INSTANCE_PORTS = "30000-30100"
+DEFAULT_MODE = "http"
+MODES = ("http", "netcat")
 
 # Docker >= 28 can leave the bridge without a gateway address. That is what
 # keeps an instance off the host: with no gateway it has a route to its own /24
@@ -80,26 +116,26 @@ NETWORK_OPTIONS = {GATEWAY_MODE_OPTION: "isolated"}
 # Instances outlive this process by design -- a crash, or a restart mid-event,
 # must not take every player's instance with it (they are re-adopted from their
 # labels on the way back up). A clean shutdown is the other case: `docker
-# compose down` means "take it all down", and compose knows nothing about
-# containers we created, so we have to. Set 0 to keep instances across a
-# deliberate stop as well.
+# compose down` means "take it all down", and compose knows nothing about the
+# containers we created -- instances or proxies -- so we have to. Set 0 to keep
+# them across a deliberate stop as well.
 REAP_ON_SHUTDOWN = os.environ.get("REAP_ON_SHUTDOWN", "1").lower() not in ("0", "false", "no")
 
 # How long a shutdown waits for an in-flight create before tearing down anyway.
 # Docker's own grace period is short; being late is worse than being rude.
 SHUTDOWN_LOCK_WAIT = 5
 
-# TTL: how long every instance lives, and how often the reaper looks. One
-# lifetime for everybody -- nothing a request can ask to make longer.
-DEFAULT_TTL = int(os.environ.get("DEFAULT_TTL", "3600"))
+# How often the reaper looks.
 CLEANUP_INTERVAL = int(os.environ.get("CLEANUP_INTERVAL", "10"))
 
 # Metadata we stash on Docker objects so a restart can recover the state.
-LABEL_OWNER = "spawnzero.owner"
-LABEL_EXPIRES = "spawnzero.expires_at"
-LABEL_SUBNET = "spawnzero.subnet"
-LABEL_PORT = "spawnzero.port"
-LABEL_KEY = "spawnzero.key"
+LABEL_CHAL = "ctf.chal"
+LABEL_OWNER = "ctf.owner"
+LABEL_EXPIRES = "ctf.expires_at"
+LABEL_SUBNET = "ctf.subnet"
+LABEL_PORT = "ctf.port"
+LABEL_KEY = "ctf.key"
+LABEL_SPEC = "ctf.proxy_spec"
 
 # What a player is told when something breaks. Docker's own messages name
 # images, ports, subnets and container ids -- all of it ours to read in the log,
@@ -108,14 +144,7 @@ ERROR_BUSY = "no free instance right now, try again in a moment"
 ERROR_CREATE = "could not start your instance, try again in a moment"
 ERROR_DESTROY = "could not stop your instance, try again in a moment"
 ERROR_SHUTDOWN = "the instancer is going down, try again shortly"
-
-# How players reach the instance decides how we show the address:
-#   http   -> a clickable http://proxy:port/<key>/ link  (web challenges)
-#   netcat -> an nc proxy port command, then the key     (pwn / raw-tcp)
-MODE = os.environ.get("MODE", "http").lower()
-if MODE not in ("http", "netcat"):
-    logging.getLogger("instancer").warning("unknown MODE %r, falling back to http", MODE)
-    MODE = "http"
+ERROR_NO_CHAL = "no such challenge"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("instancer")
@@ -123,34 +152,38 @@ log = logging.getLogger("instancer")
 
 # --- names --------------------------------------------------------------------
 
-DEFAULT_CONFIG = {
-    "chal_name": "challenge",
-    "author": "",
-    "type": "",
-    "instancer_name": "SpawnZero",
-}
+DEFAULT_CONFIG = {"instancer_name": "SpawnZero"}
 
 
-def load_config(path=None):
-    """Read config.yml. Names only -- nothing here changes how anything runs.
+def read_yaml(path):
+    """Load one config file. Returns a mapping, or None if it is not usable.
 
-    A missing or broken file is not fatal: an instancer that will not start
-    because someone fat-fingered a display name would be a worse trade than one
-    that starts with a placeholder on the page and a complaint in the log.
+    A missing or broken file is never fatal here: an instancer that will not
+    start because someone fat-fingered a display name would be a worse trade
+    than one that starts with a placeholder and a complaint in the log.
     """
-    path = path or CONFIG_FILE
     try:
         with open(path) as handle:
             loaded = yaml.safe_load(handle) or {}
     except OSError as exc:
-        log.warning("no config file at %s (%s), falling back to defaults", path, exc)
-        return dict(DEFAULT_CONFIG)
+        log.warning("no config file at %s (%s)", path, exc)
+        return None
     except yaml.YAMLError as exc:
-        log.error("config file %s is not valid YAML (%s), falling back to defaults",
-                  path, exc)
-        return dict(DEFAULT_CONFIG)
+        log.error("config file %s is not valid YAML (%s)", path, exc)
+        return None
     if not isinstance(loaded, dict):
-        log.error("config file %s is not a mapping, falling back to defaults", path)
+        log.error("config file %s is not a mapping", path)
+        return None
+    return loaded
+
+
+def load_config(path=None):
+    """Read the instancer's own config.yml. Names only -- nothing here changes
+    how anything runs; that is what each challenge's config.yml is for."""
+    path = path or CONFIG_FILE
+    loaded = read_yaml(path)
+    if loaded is None:
+        log.warning("falling back to default names")
         return dict(DEFAULT_CONFIG)
     unknown = set(loaded) - set(DEFAULT_CONFIG)
     if unknown:
@@ -162,6 +195,181 @@ def load_config(path=None):
 
 
 CONFIG = load_config()
+
+
+# --- challenges ---------------------------------------------------------------
+
+class Challenge:
+    """One challenge: its directory, its image, its proxy, and what an instance
+    of it is allowed to be.
+
+    Everything here is per challenge by nature -- two challenges are two proxies
+    on two ports, and a web app deserves a different ceiling than a pwn box --
+    which is why it is written next to the Dockerfile rather than passed in from
+    the environment, where there is only ever one of anything.
+    """
+
+    def __init__(self, cid, directory, config):
+        self.id = cid
+        self.dir = directory
+        self.name = config["name"] or cid
+        self.author = config["author"]
+        self.type = config["type"]
+        self.mode = config["mode"]
+        self.proxy_port = config["proxy_port"]
+        self.proxy_host = config["proxy_host"] or PROXY_HOST
+        self.ttl = config["ttl"]
+        self.mem_limit = config["mem_limit"]
+        self.pids_limit = config["pids_limit"]
+        self.subnet_pool = config["subnet_pool"]
+        self.subnet_prefix = config["subnet_prefix"]
+        self.port_min, self.port_max = config["instance_ports"]
+        self.image = CHALLENGE_IMAGE.format(chal=cid)
+        self.proxy = PROXY_NAME.format(chal=cid)
+
+    @property
+    def capacity(self):
+        """How many instances of it can be up at once: one port each."""
+        return self.port_max - self.port_min + 1
+
+    def __repr__(self):
+        return "<Challenge %s on :%d (%s)>" % (self.id, self.proxy_port, self.mode)
+
+
+# What a challenge's config.yml may say, and what it means when it does not.
+# `proxy_port` has no sensible default: a challenge nobody can reach is not one.
+DEFAULT_CHALLENGE = {
+    "name": "",
+    "author": "",
+    "type": "",
+    "mode": DEFAULT_MODE,
+    "proxy_port": 0,
+    "proxy_host": "",
+    "ttl": DEFAULT_TTL,
+    "mem_limit": DEFAULT_MEM_LIMIT,
+    "pids_limit": DEFAULT_PIDS_LIMIT,
+    "subnet_pool": DEFAULT_SUBNET_POOL,
+    "subnet_prefix": DEFAULT_SUBNET_PREFIX,
+    "instance_ports": DEFAULT_INSTANCE_PORTS,
+}
+CHALLENGE_INTS = ("proxy_port", "ttl", "pids_limit", "subnet_prefix")
+
+
+def parse_ports(text):
+    """`30000-30100`, or a single port. Returns (first, last), or None."""
+    first, _, last = str(text).partition("-")
+    try:
+        low, high = int(first), int(last or first)
+    except ValueError:
+        return None
+    return (low, high) if 1 <= low <= high <= 65535 else None
+
+
+def load_challenge(cid, directory):
+    """Read one challenge directory. Returns a Challenge, or None with a reason
+    in the log -- one unusable challenge must not take the others down."""
+    if not CHALLENGE_ID.match(cid):
+        log.error("ignoring %s: a challenge id must be lowercase letters, digits "
+                  "and dashes -- it goes in URLs and container names", cid)
+        return None
+    if not os.path.isfile(os.path.join(directory, "Dockerfile")):
+        log.error("ignoring %s: no Dockerfile in %s", cid, directory)
+        return None
+    loaded = read_yaml(os.path.join(directory, CHALLENGE_CONFIG))
+    if loaded is None:
+        log.error("ignoring %s: no usable %s", cid, CHALLENGE_CONFIG)
+        return None
+    unknown = set(loaded) - set(DEFAULT_CHALLENGE)
+    if unknown:
+        log.warning("ignoring unknown key(s) in %s/%s: %s", cid, CHALLENGE_CONFIG,
+                    ", ".join(sorted(unknown)))
+
+    config = dict(DEFAULT_CHALLENGE)
+    for key, fallback in DEFAULT_CHALLENGE.items():
+        value = loaded.get(key)
+        if value is None:
+            continue
+        if key in CHALLENGE_INTS:
+            try:
+                config[key] = int(value)
+            except (TypeError, ValueError):
+                log.warning("%s: %s=%r is not a number, using %r", cid, key, value, fallback)
+        else:
+            config[key] = str(value)
+
+    if config["mode"] not in MODES:
+        log.warning("%s: unknown mode %r, falling back to %s", cid, config["mode"],
+                    DEFAULT_MODE)
+        config["mode"] = DEFAULT_MODE
+    if not 1 <= config["proxy_port"] <= 65535:
+        log.error("ignoring %s: proxy_port %r is not a port players could reach",
+                  cid, config["proxy_port"])
+        return None
+    if config["ttl"] <= 0:
+        log.warning("%s: ttl %r is not a lifetime, using %d", cid, config["ttl"],
+                    DEFAULT_TTL)
+        config["ttl"] = DEFAULT_TTL
+
+    ports = parse_ports(config["instance_ports"])
+    if ports is None:
+        log.warning("%s: instance_ports %r is not a port range, using %s", cid,
+                    config["instance_ports"], DEFAULT_INSTANCE_PORTS)
+        ports = parse_ports(DEFAULT_INSTANCE_PORTS)
+    config["instance_ports"] = ports
+
+    try:
+        pool = ipaddress.ip_network(config["subnet_pool"])
+    except ValueError as exc:
+        log.warning("%s: subnet_pool %r is not a network (%s), using %s", cid,
+                    config["subnet_pool"], exc, DEFAULT_SUBNET_POOL)
+        pool = ipaddress.ip_network(DEFAULT_SUBNET_POOL)
+    if not pool.prefixlen <= config["subnet_prefix"] <= pool.max_prefixlen:
+        log.warning("%s: subnet_prefix /%d does not divide %s, using /%d", cid,
+                    config["subnet_prefix"], pool, DEFAULT_SUBNET_PREFIX)
+        config["subnet_prefix"] = DEFAULT_SUBNET_PREFIX
+    config["subnet_pool"] = pool
+    return Challenge(cid, directory, config)
+
+
+def load_challenges(path=None):
+    """Every challenge under CHALLENGES_DIR, by id, in the order they are shown.
+
+    Adding a challenge is a directory and a restart; nothing else in the system
+    is told that challenges exist. Two of them wanting the same proxy port is
+    the one clash worth refusing outright -- Docker would refuse the second
+    container anyway, and later, with less to say about why.
+    """
+    path = path or CHALLENGES_DIR
+    try:
+        entries = sorted(os.listdir(path))
+    except OSError as exc:
+        log.error("cannot read %s (%s): serving no challenges", path, exc)
+        return {}
+    challenges, ports = {}, {}
+    for cid in entries:
+        directory = os.path.join(path, cid)
+        if not os.path.isdir(directory):
+            continue
+        challenge = load_challenge(cid, directory)
+        if challenge is None:
+            continue
+        clash = ports.get(challenge.proxy_port)
+        if clash is not None:
+            log.error("ignoring %s: proxy_port %d is already %s's",
+                      cid, challenge.proxy_port, clash)
+            continue
+        ports[challenge.proxy_port] = cid
+        challenges[cid] = challenge
+    return challenges
+
+
+CHALLENGES = load_challenges()
+
+
+def challenge(chal):
+    """The Challenge with this id, or None. Players hand us the id."""
+    return CHALLENGES.get(chal)
+
 
 app = Flask(__name__)
 app.secret_key = SECRET_KEY or secrets.token_hex(32)
@@ -175,22 +383,25 @@ app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 #                arriving at once queue on the pick (milliseconds) instead of on
 #                each other's containers (a second or more, each).
 #
-#   owner locks  one per session: everything that touches *one* instance goes
-#                through it -- create, destroy, the stale-container sweep, the
-#                reaper. Two requests about the same instance queue up, so a
-#                double-clicked START cannot build two, and a status poll cannot
-#                delete a container that is still being started.
+#   owner locks  one per session per challenge: everything that touches *one*
+#                instance goes through it -- create, destroy, the stale-container
+#                sweep, the reaper. Two requests about the same instance queue up,
+#                so a double-clicked START cannot build two, and a status poll
+#                cannot delete a container that is still being started.
 #
-# The owner locks are a fixed set, picked by session id rather than a dict that
-# would grow for every session an event ever sees. Two unrelated players may
-# share one and briefly wait on each other; that is cheaper than the bookkeeping.
+# The owner locks are a fixed set, picked by challenge and session id rather than
+# a dict that would grow for every session an event ever sees. Two unrelated
+# players may share one and briefly wait on each other; that is cheaper than the
+# bookkeeping.
 pool_lock = threading.Lock()
 OWNER_STRIPES = 64
 owner_locks = [threading.Lock() for _ in range(OWNER_STRIPES)]
 
 # Claimed by a create that is still building. Docker is the record of what is in
 # use, but only once the container exists -- a second or two later. Until then
-# the claim lives here, or two players would be handed the same port.
+# the claim lives here, or two players would be handed the same port. Ports are
+# claimed per challenge, subnets across all of them, for the same reason each is
+# picked that way.
 reserved_ports = set()
 reserved_subnets = set()
 
@@ -199,9 +410,9 @@ reserved_subnets = set()
 shutting_down = threading.Event()
 
 
-def owner_lock(owner):
-    """The lock for one session. Same session, same lock."""
-    return owner_locks[hash(owner) % OWNER_STRIPES]
+def owner_lock(chal, owner):
+    """The lock for one instance. Same challenge and session, same lock."""
+    return owner_locks[hash((chal, owner)) % OWNER_STRIPES]
 
 _client = None
 
@@ -214,36 +425,52 @@ def client():
 
 
 def owner_id():
-    """Id of the current browser session, minted on first use."""
+    """Id of the current browser session, minted on first use. One session owns
+    at most one instance of each challenge."""
     if "owner" not in session:
         session.permanent = True
         session["owner"] = secrets.token_hex(8)
     return session["owner"]
 
 
-def container_name(owner):
-    return CONTAINER_PREFIX + owner
+def container_name(chal, owner):
+    return CONTAINER_NAME.format(chal=chal, owner=owner)
 
 
-def network_name(owner):
-    return NETWORK_PREFIX + owner
+def network_name(chal, owner):
+    return NETWORK_NAME.format(chal=chal, owner=owner)
+
+
+def proxy_name(chal):
+    return PROXY_NAME.format(chal=chal)
+
+
+def name_parts(name, prefix):
+    """(challenge, owner) back out of a name we made.
+
+    Owner ids are hex and a challenge id may contain dashes, so the last dash is
+    the seam. Only a fallback: both halves are on the object as labels.
+    """
+    chal, _, owner = name[len(prefix):].rpartition("-")
+    return chal, owner
 
 
 # --- instance lookup ----------------------------------------------------------
 
-def get_instance(owner):
-    """Return this session's running container, or None.
+def get_instance(chal, owner):
+    """Return this session's running container for a challenge, or None.
 
     A leftover stopped container (and its network) is removed so the name,
     port, subnet and key are free again.
     """
     try:
-        container = client().containers.get(container_name(owner))
+        container = client().containers.get(container_name(chal, owner))
     except NotFound:
         return None
     if container.status != "running":
-        log.info("removing stale container of %s (status=%s)", owner, container.status)
-        remove_instance(owner)
+        log.info("removing stale %s container of %s (status=%s)", chal, owner,
+                 container.status)
+        remove_instance(chal, owner)
         return None
     return container
 
@@ -259,8 +486,12 @@ def label_int(container, name):
         return None
 
 
+def instance_chal(container):
+    return label(container, LABEL_CHAL) or name_parts(container.name, CONTAINER_PREFIX)[0]
+
+
 def instance_owner(container):
-    return label(container, LABEL_OWNER) or container.name[len(CONTAINER_PREFIX):]
+    return label(container, LABEL_OWNER) or name_parts(container.name, CONTAINER_PREFIX)[1]
 
 
 def instance_port(container):
@@ -274,25 +505,27 @@ def instance_expires_at(container):
 def instance_address(container):
     """The instance's address on its own network -- what the proxy dials."""
     networks = (container.attrs.get("NetworkSettings") or {}).get("Networks") or {}
-    endpoint = networks.get(network_name(instance_owner(container))) or {}
+    endpoint = networks.get(network_name(instance_chal(container),
+                                         instance_owner(container))) or {}
     return endpoint.get("IPAddress") or None
 
 
-def list_instances():
-    """Every instance container, running or not."""
-    return [c for c in client().containers.list(all=True)
-            if c.name.startswith(CONTAINER_PREFIX)]
+def list_instances(chal=None):
+    """Every instance container, running or not -- of one challenge, or of all."""
+    prefix = CONTAINER_PREFIX + (chal + "-" if chal else "")
+    return [c for c in client().containers.list(all=True) if c.name.startswith(prefix)]
 
 
-def find_by_key(key):
-    """The running instance a key belongs to, or None.
+def find_by_key(chal, key):
+    """The running instance of this challenge a key belongs to, or None.
 
     Compared in constant time and against running containers only, so a key
-    stops working the moment its instance does.
+    stops working the moment its instance does. Scoped to the challenge whose
+    proxy is asking, so one key is one door and not a set of them.
     """
     if not key or not key.isascii():
         return None
-    for container in list_instances():
+    for container in list_instances(chal):
         if container.status != "running":
             continue
         if secrets.compare_digest(label(container, LABEL_KEY) or "", key):
@@ -302,23 +535,24 @@ def find_by_key(key):
 
 # --- ports --------------------------------------------------------------------
 
-def used_ports():
-    """Ports already handed to an instance.
+def used_ports(chal):
+    """Ports already handed to an instance of this challenge.
 
-    Only instances can hold one: the port lives inside the instance's own
-    network namespace, so nothing else on the host can be in the way.
+    Per challenge, because the port lives inside the instance's own network
+    namespace: two challenges may hand out the same number all day.
     """
-    return {port for port in (instance_port(c) for c in list_instances())
+    return {port for port in (instance_port(c) for c in list_instances(chal))
             if port is not None}
 
 
-def pick_port(reserved=()):
-    used = used_ports() | set(reserved)
-    for port in range(INSTANCE_PORT_MIN, INSTANCE_PORT_MAX + 1):
+def pick_port(chal, reserved=()):
+    """A port free in this challenge's own range."""
+    used = used_ports(chal.id) | {port for c, port in reserved if c == chal.id}
+    for port in range(chal.port_min, chal.port_max + 1):
         if port not in used:
             return port
-    raise RuntimeError("no free instance port in %d-%d"
-                       % (INSTANCE_PORT_MIN, INSTANCE_PORT_MAX))
+    raise RuntimeError("no free instance port in %d-%d for %s"
+                       % (chal.port_min, chal.port_max, chal.id))
 
 
 # --- subnets ------------------------------------------------------------------
@@ -338,12 +572,19 @@ def used_subnets():
     return used
 
 
-def pick_subnet(reserved=()):
+def pick_subnet(chal, reserved=()):
+    """A subnet free in this challenge's own pool.
+
+    Checked against every network on the daemon, not just this pool, so two
+    challenges pointed at overlapping pools share the space instead of colliding
+    in it -- they just run out sooner.
+    """
     used = used_subnets() + list(reserved)
-    for subnet in SUBNET_POOL.subnets(new_prefix=SUBNET_PREFIX):
+    for subnet in chal.subnet_pool.subnets(new_prefix=chal.subnet_prefix):
         if not any(subnet.overlaps(u) for u in used):
             return subnet
-    raise RuntimeError("no free /%d subnet in %s" % (SUBNET_PREFIX, SUBNET_POOL))
+    raise RuntimeError("no free /%d subnet in %s for %s"
+                       % (chal.subnet_prefix, chal.subnet_pool, chal.id))
 
 
 # --- keys ---------------------------------------------------------------------
@@ -354,112 +595,116 @@ def pick_key():
 
 # --- reservations -------------------------------------------------------------
 
-def reserve():
+def reserve(chal):
     """Take a port and a subnet nobody else can be given.
 
-    Held under pool_lock only long enough to read what Docker has and write the
-    claim; the slow part -- building the network and the container -- happens
-    with the lock released, so everyone else can be picking meanwhile.
+    Both come out of this challenge's own config: its port range and its subnet
+    pool. Held under pool_lock only long enough to read what Docker has and
+    write the claim; the slow part -- building the network and the container --
+    happens with the lock released, so everyone else can be picking meanwhile.
     """
     with pool_lock:
-        port = pick_port(reserved_ports)
-        subnet = pick_subnet(reserved_subnets)
-        reserved_ports.add(port)
+        port = pick_port(chal, reserved_ports)
+        subnet = pick_subnet(chal, reserved_subnets)
+        reserved_ports.add((chal.id, port))
         reserved_subnets.add(subnet)
         return port, subnet
 
 
-def release(port, subnet):
+def release(chal, port, subnet):
     """Drop the claim -- either Docker holds the record now, or nothing does."""
     with pool_lock:
-        reserved_ports.discard(port)
+        reserved_ports.discard((chal, port))
         reserved_subnets.discard(subnet)
 
 
 # --- create / destroy ---------------------------------------------------------
 
-def create_network(owner, subnet):
+def create_network(chal, owner, subnet):
     """The instance's own network: internal, and ideally without a gateway."""
     kwargs = dict(
         driver="bridge",
         internal=True,
         ipam=docker.types.IPAMConfig(
             pool_configs=[docker.types.IPAMPool(subnet=str(subnet))]),
-        labels={LABEL_OWNER: owner, LABEL_SUBNET: str(subnet)},
+        labels={LABEL_CHAL: chal, LABEL_OWNER: owner, LABEL_SUBNET: str(subnet)},
         check_duplicate=True,
     )
     try:
-        return client().networks.create(network_name(owner),
+        return client().networks.create(network_name(chal, owner),
                                         options=NETWORK_OPTIONS, **kwargs)
     except APIError as exc:
         log.warning("daemon rejected %s=isolated (%s); the instance network keeps "
                     "a reachable gateway address -- upgrade to Docker 28+ to close it",
                     GATEWAY_MODE_OPTION, exc)
-        return client().networks.create(network_name(owner), **kwargs)
+        return client().networks.create(network_name(chal, owner), **kwargs)
 
 
-def attach_proxy(owner):
-    """Give the proxy an interface on this instance's network.
+def attach_proxy(chal, owner):
+    """Give this challenge's proxy an interface on this instance's network.
 
-    The proxy answers only on its control-network address, so this is a one-way
+    A proxy answers only on its control-network address, so this is a one-way
     door: the proxy can dial the instance, the instance finds nothing listening.
+    And it is *this* challenge's proxy: no proxy is ever on a network belonging
+    to a challenge that is not its own.
     """
-    client().networks.get(network_name(owner)).connect(PROXY_CONTAINER)
+    client().networks.get(network_name(chal, owner)).connect(proxy_name(chal))
 
 
-def detach_proxy(network):
+def detach_proxy(network, chal):
     """Best effort: a half-built instance may never have got the proxy attached.
 
     A detach that really was needed and really failed is not swallowed -- the
     removal right after it fails loudly with "has active endpoints".
     """
     try:
-        network.disconnect(PROXY_CONTAINER, force=True)
+        network.disconnect(proxy_name(chal), force=True)
     except (NotFound, APIError) as exc:
         log.debug("proxy not detached from %s: %s", network.name, exc)
 
 
-def remove_network(owner):
-    """Remove this owner's network. Docker refuses while the proxy is attached."""
+def remove_network(chal, owner):
+    """Remove this instance's network. Docker refuses while the proxy is on it."""
     try:
-        network = client().networks.get(network_name(owner))
+        network = client().networks.get(network_name(chal, owner))
     except NotFound:
         return
-    detach_proxy(network)
+    detach_proxy(network, chal)
     try:
         network.remove()
     except APIError as exc:
-        log.error("could not remove network for %s: %s", owner, exc)
+        log.error("could not remove network for %s/%s: %s", chal, owner, exc)
 
 
-def remove_instance(owner):
-    """Remove this owner's container and its network. Safe if either is gone.
+def remove_instance(chal, owner):
+    """Remove this instance's container and network. Safe if either is gone.
 
     Returns True if a container was actually removed.
     """
     removed = False
     try:
-        client().containers.get(container_name(owner)).remove(force=True)
+        client().containers.get(container_name(chal, owner)).remove(force=True)
         removed = True
     except NotFound:
         pass
-    remove_network(owner)
+    remove_network(chal, owner)
     return removed
 
 
-def create_container(owner, port, subnet, key, expires_at):
+def create_container(chal, owner, port, subnet, key, expires_at):
     limits = {}
-    if MEM_LIMIT:
-        limits["mem_limit"] = MEM_LIMIT
-    if PIDS_LIMIT:
-        limits["pids_limit"] = PIDS_LIMIT
+    if chal.mem_limit:
+        limits["mem_limit"] = chal.mem_limit
+    if chal.pids_limit:
+        limits["pids_limit"] = chal.pids_limit
     return client().containers.create(
-        CHALLENGE_IMAGE,
-        name=container_name(owner),
+        chal.image,
+        name=container_name(chal.id, owner),
         # No ports=: publishing one would be a way in that skips the proxy.
-        network=network_name(owner),
+        network=network_name(chal.id, owner),
         environment={PORT_ENV: str(port)},
         labels={
+            LABEL_CHAL: chal.id,
             LABEL_OWNER: owner,
             LABEL_EXPIRES: str(expires_at),
             LABEL_SUBNET: str(subnet),
@@ -470,28 +715,160 @@ def create_container(owner, port, subnet, key, expires_at):
     )
 
 
-def image_exists():
+# --- images -------------------------------------------------------------------
+
+def image_exists(tag):
     try:
-        client().images.get(CHALLENGE_IMAGE)
+        client().images.get(tag)
         return True
     except ImageNotFound:
         return False
 
 
-def build_image():
+def build_image(tag, path, what):
     # Building on every startup would block the web server for minutes each boot
-    # (the SDK's builder re-runs the challenge's apt install). Build only when the
-    # image is missing; set FORCE_BUILD=1 to rebuild after changing the challenge.
-    if image_exists() and not FORCE_BUILD:
-        log.info("challenge image %s already present, skipping build "
-                 "(set FORCE_BUILD=1 to rebuild)", CHALLENGE_IMAGE)
+    # (the SDK's builder re-runs every challenge's apt install). Build only when
+    # the image is missing; set FORCE_BUILD=1 to rebuild after changing one.
+    if image_exists(tag) and not FORCE_BUILD:
+        log.info("%s image %s already present, skipping build "
+                 "(set FORCE_BUILD=1 to rebuild)", what, tag)
         return
-    log.info("building challenge image %s from %s", CHALLENGE_IMAGE, CHALLENGE_DIR)
-    client().images.build(path=CHALLENGE_DIR, tag=CHALLENGE_IMAGE, rm=True)
-    log.info("challenge image built: %s", CHALLENGE_IMAGE)
+    log.info("building %s image %s from %s", what, tag, path)
+    client().images.build(path=path, tag=tag, rm=True)
+    log.info("%s image built: %s", what, tag)
 
 
-def instance_json(container):
+# --- proxies ------------------------------------------------------------------
+
+def proxy_token(chal):
+    """The token this challenge's proxy presents when it resolves a key.
+
+    Derived from the shared secret rather than stored, so it costs nothing to
+    keep, survives a restart unchanged, and is not the same token as the one on
+    the proxy next to it -- one taken off a proxy opens that challenge and no
+    other.
+    """
+    return hmac.new(PROXY_TOKEN.encode(), chal.encode(), hashlib.sha256).hexdigest()
+
+
+def proxy_spec(chal):
+    """What a proxy container was built to be. Stamped on it, so a restart can
+    tell "already running" from "running the previous config.yml"."""
+    return "%s|%d|%s" % (chal.mode, chal.proxy_port, chal.image)
+
+
+def control_network():
+    return client().networks.get(CONTROL_NETWORK)
+
+
+def pick_proxy_address(network):
+    """A free address on the control network, for one proxy to bind."""
+    network.reload()
+    config = ((network.attrs.get("IPAM") or {}).get("Config") or [{}])[0]
+    subnet = ipaddress.ip_network(config["Subnet"])
+    taken = set()
+    if config.get("Gateway"):
+        taken.add(ipaddress.ip_address(config["Gateway"].split("/")[0]))
+    for info in (network.attrs.get("Containers") or {}).values():
+        if info.get("IPv4Address"):
+            taken.add(ipaddress.ip_interface(info["IPv4Address"]).ip)
+    for index, host in enumerate(subnet.hosts()):
+        if index >= PROXY_ADDRESS_OFFSET and host not in taken:
+            return str(host)
+    raise RuntimeError("no free address on %s" % CONTROL_NETWORK)
+
+
+def list_proxies():
+    return [c for c in client().containers.list(all=True)
+            if c.name.startswith(PROXY_PREFIX)]
+
+
+def create_proxy(chal):
+    """This challenge's proxy: one container, one published port, one address.
+
+    The address is the point. A proxy binds only its control-network address, so
+    the instance networks it is attached to later have nothing to connect back
+    to -- which is why the instancer picks the address and hands it over, rather
+    than letting the proxy guess which of its interfaces is the safe one.
+    """
+    network = control_network()
+    address = pick_proxy_address(network)
+    container = client().containers.create(
+        PROXY_IMAGE,
+        name=chal.proxy,
+        hostname=chal.proxy,
+        environment={
+            "PROXY_BIND": address,
+            "PROXY_PORT": str(chal.proxy_port),
+            "PROXY_TOKEN": proxy_token(chal.id),
+            "PROXY_CHAL": chal.id,
+            "INSTANCER_URL": INSTANCER_URL,
+            "MODE": chal.mode,
+        },
+        ports={"%d/tcp" % chal.proxy_port: chal.proxy_port},
+        network=CONTROL_NETWORK,
+        networking_config={
+            CONTROL_NETWORK: client().api.create_endpoint_config(ipv4_address=address)},
+        labels={LABEL_CHAL: chal.id, LABEL_SPEC: proxy_spec(chal)},
+        restart_policy={"Name": "unless-stopped"},
+    )
+    container.start()
+    log.info("proxy for %s up on %s:%d, bound %s", chal.id, chal.mode,
+             chal.proxy_port, address)
+    return container
+
+
+def remove_proxy(chal):
+    """Take a proxy away. Its instances' networks must be gone first -- Docker
+    refuses to remove a container that still has endpoints in use."""
+    try:
+        client().containers.get(proxy_name(chal)).remove(force=True)
+    except NotFound:
+        return False
+    return True
+
+
+def ensure_proxy(chal):
+    """The proxy this challenge needs, running the config.yml it has now.
+
+    Adopted if it is already what it should be -- players mid-connection are not
+    interrupted by a restart of the instancer. Replaced if the challenge's mode,
+    port or image changed underneath it, because a proxy is only ever as right
+    as the config it was created with.
+    """
+    try:
+        container = client().containers.get(chal.proxy)
+    except NotFound:
+        return create_proxy(chal)
+    if container.status == "running" and label(container, LABEL_SPEC) == proxy_spec(chal):
+        log.info("adopted proxy for %s (%s:%d)", chal.id, chal.mode, chal.proxy_port)
+        return container
+    log.info("replacing proxy for %s (status=%s, spec=%s, wanted %s)", chal.id,
+             container.status, label(container, LABEL_SPEC), proxy_spec(chal))
+    container.remove(force=True)
+    return create_proxy(chal)
+
+
+def remove_stale_proxies():
+    """Proxies of challenges that are no longer there.
+
+    Done before the others are brought up: a removed challenge's proxy is still
+    holding its published port, and the next challenge to want that port would
+    otherwise fail for a reason that has nothing to do with it.
+    """
+    for container in list_proxies():
+        chal = label(container, LABEL_CHAL) or container.name[len(PROXY_PREFIX):]
+        if chal in CHALLENGES:
+            continue
+        log.info("removing proxy of unknown challenge %s", chal)
+        for instance in list_instances(chal):
+            remove_instance(chal, instance_owner(instance))
+        container.remove(force=True)
+
+
+# --- what a player is told ----------------------------------------------------
+
+def instance_json(chal, container):
     """What the player's page gets: how to connect, and how long they have.
 
     Deliberately not in here: the instance's port, its address, its subnet, its
@@ -501,19 +878,52 @@ def instance_json(container):
     expires_at = instance_expires_at(container)
     remaining = max(0, expires_at - int(time.time())) if expires_at is not None else None
     return jsonify(
+        chal=chal.id,
+        name=chal.name,
         running=True,
-        mode=MODE,
+        mode=chal.mode,
         key=label(container, LABEL_KEY),
-        proxy_host=PROXY_HOST or None,
-        proxy_port=PROXY_PORT,
+        proxy_host=chal.proxy_host or None,
+        proxy_port=chal.proxy_port,
         expires_at=expires_at,
         remaining_time=remaining,
     )
 
 
-def idle_json():
-    return jsonify(running=False, mode=MODE,
-                   proxy_host=PROXY_HOST or None, proxy_port=PROXY_PORT)
+def idle_json(chal):
+    return jsonify(chal=chal.id, name=chal.name, running=False, mode=chal.mode,
+                   proxy_host=chal.proxy_host or None, proxy_port=chal.proxy_port)
+
+
+def challenge_json(chal, owner):
+    """One line of the index: what the challenge is, and whether you have one.
+
+    Under the owner's lock for the same reason /status is: get_instance() sweeps
+    away a container that is not running, and "not running yet" is what a
+    container looks like while its own create is still building it. The list
+    polls, so an index left open in one tab would otherwise delete the instance
+    the next tab is starting.
+    """
+    container = None
+    if owner:
+        with owner_lock(chal.id, owner):
+            container = get_instance(chal.id, owner)
+    expires_at = instance_expires_at(container) if container is not None else None
+    return {
+        "chal": chal.id,
+        "name": chal.name,
+        "author": chal.author,
+        "type": chal.type,
+        "mode": chal.mode,
+        "ttl": chal.ttl,
+        "running": container is not None,
+        "remaining_time": (max(0, expires_at - int(time.time()))
+                           if expires_at is not None else None),
+    }
+
+
+def no_such_challenge():
+    return jsonify(running=False, error=ERROR_NO_CHAL), 404
 
 
 # --- routes -------------------------------------------------------------------
@@ -523,98 +933,125 @@ def index():
     # Mint the session here, so two fast clicks on Start cannot race each other
     # into two identities (and therefore two containers).
     owner_id()
-    return render_template("index.html", mode=MODE, default_ttl=DEFAULT_TTL,
-                           proxy_host=PROXY_HOST, proxy_port=PROXY_PORT, **CONFIG)
+    return render_template("index.html", challenges=list(CHALLENGES.values()), **CONFIG)
 
 
-@app.get("/status")
-def status():
+@app.get("/c/<chal>")
+def challenge_page(chal):
+    found = challenge(chal)
+    if found is None:
+        return render_template("missing.html", chal=chal, **CONFIG), 404
+    owner_id()
+    return render_template("challenge.html", chal=found, **CONFIG)
+
+
+@app.get("/api/challenges")
+def api_challenges():
+    owner = session.get("owner")
+    return jsonify(challenges=[challenge_json(c, owner) for c in CHALLENGES.values()])
+
+
+@app.get("/api/<chal>/status")
+def status(chal):
+    found = challenge(chal)
+    if found is None:
+        return no_such_challenge()
     owner = session.get("owner")
     if owner is None:
-        return idle_json()
+        return idle_json(found)
     # Under the owner's lock: get_instance() sweeps away a container that is not
     # running, and "not running yet" is what a container looks like for the
     # moment between being created and being started. Polling while a create is
     # in flight would otherwise delete the instance being built.
-    with owner_lock(owner):
-        container = get_instance(owner)
+    with owner_lock(chal, owner):
+        container = get_instance(chal, owner)
         if container is None:
-            return idle_json()
-        return instance_json(container)
+            return idle_json(found)
+        return instance_json(found, container)
 
 
-@app.post("/create")
-def create():
+@app.post("/api/<chal>/create")
+def create(chal):
+    found = challenge(chal)
+    if found is None:
+        return no_such_challenge()
     owner = owner_id()
     if shutting_down.is_set():
-        return jsonify(running=False, mode=MODE, error=ERROR_SHUTDOWN), 503
-    with owner_lock(owner):
-        container = get_instance(owner)
+        return jsonify(running=False, mode=found.mode, error=ERROR_SHUTDOWN), 503
+    with owner_lock(chal, owner):
+        container = get_instance(chal, owner)
         if container is not None:
-            return instance_json(container)
+            return instance_json(found, container)
 
         # Clear any orphan network left behind by a previous life of this owner.
-        remove_network(owner)
+        remove_network(chal, owner)
 
         port = subnet = None
         try:
-            port, subnet = reserve()
+            port, subnet = reserve(found)
             key = pick_key()
-            expires_at = int(time.time()) + DEFAULT_TTL
-            create_network(owner, subnet)
-            attach_proxy(owner)
-            container = create_container(owner, port, subnet, key, expires_at)
+            expires_at = int(time.time()) + found.ttl
+            create_network(chal, owner, subnet)
+            attach_proxy(chal, owner)
+            container = create_container(found, owner, port, subnet, key, expires_at)
             container.start()
             container.reload()
         except Exception as exc:
-            log.error("create failed for %s: %s", owner, exc)
+            log.error("create failed for %s/%s: %s", chal, owner, exc)
             try:
-                remove_instance(owner)
+                remove_instance(chal, owner)
             except (DockerException, OSError) as cleanup_exc:
                 log.error("cleanup after failed create: %s", cleanup_exc)
             # reserve() raises RuntimeError when the pools are full -- the one
             # failure a player can actually do something about (wait).
             if isinstance(exc, RuntimeError):
-                return jsonify(running=False, mode=MODE, error=ERROR_BUSY), 503
-            return jsonify(running=False, mode=MODE, error=ERROR_CREATE), 500
+                return jsonify(running=False, mode=found.mode, error=ERROR_BUSY), 503
+            return jsonify(running=False, mode=found.mode, error=ERROR_CREATE), 500
         finally:
             # Either the container exists and Docker records the claim, or
             # nothing does; either way ours is no longer needed.
-            release(port, subnet)
+            release(chal, port, subnet)
 
-        log.info("instance created for %s: %s port %d, subnet %s, ttl %ds",
-                 owner, instance_address(container) or "?", port, subnet, DEFAULT_TTL)
-        return instance_json(container)
+        log.info("instance created for %s/%s: %s port %d, subnet %s, ttl %ds",
+                 chal, owner, instance_address(container) or "?", port, subnet,
+                 found.ttl)
+        return instance_json(found, container)
 
 
-@app.post("/destroy")
-def destroy():
+@app.post("/api/<chal>/destroy")
+def destroy(chal):
+    found = challenge(chal)
+    if found is None:
+        return no_such_challenge()
     owner = session.get("owner")
     if owner is None:
-        return idle_json()
-    with owner_lock(owner):
+        return idle_json(found)
+    with owner_lock(chal, owner):
         try:
-            removed = remove_instance(owner)
+            removed = remove_instance(chal, owner)
         except Exception as exc:
-            log.error("destroy failed for %s: %s", owner, exc)
-            return jsonify(running=True, mode=MODE, error=ERROR_DESTROY), 500
+            log.error("destroy failed for %s/%s: %s", chal, owner, exc)
+            return jsonify(running=True, mode=found.mode, error=ERROR_DESTROY), 500
     if removed:
-        log.info("instance destroyed for %s", owner)
-    return idle_json()
+        log.info("instance destroyed for %s/%s", chal, owner)
+    return idle_json(found)
 
 
-@app.get("/internal/route/<key>")
-def route(key):
-    """Key -> instance address. The proxy is the only caller.
+@app.get("/internal/route/<chal>/<key>")
+def route(chal, key):
+    """Key -> instance address. A challenge's own proxy is the only caller.
 
     Turning a key into an address is the whole authority in this system, so the
-    call carries a shared token; without it -- or with a key nobody owns -- the
-    answer is the same 404, and the proxy has nowhere to send the player.
+    call carries the token that belongs to this challenge and no other; without
+    it -- or with a key nobody owns -- the answer is the same 404, and the proxy
+    has nowhere to send the player.
     """
     presented = request.headers.get("X-Proxy-Token", "")
-    if not PROXY_TOKEN or not secrets.compare_digest(presented, PROXY_TOKEN):
+    if not PROXY_TOKEN or not presented.isascii() or chal not in CHALLENGES:
         return jsonify(error="not found"), 404
-    container = find_by_key(key)
+    if not secrets.compare_digest(presented, proxy_token(chal)):
+        return jsonify(error="not found"), 404
+    container = find_by_key(chal, key)
     host = instance_address(container) if container is not None else None
     if host is None:
         return jsonify(error="not found"), 404
@@ -624,25 +1061,29 @@ def route(key):
 # --- TTL reaper ---------------------------------------------------------------
 
 def reap_expired():
-    """Destroy expired instances and drop networks whose container is gone."""
+    """Destroy expired instances and drop networks whose container is gone.
+
+    Works off labels, not off the loaded config, so the instances of a challenge
+    that was taken off disk still expire on schedule instead of living forever.
+    """
     for container in list_instances():
-        owner = instance_owner(container)
+        chal, owner = instance_chal(container), instance_owner(container)
         if instance_expires_at(container) is None:
             continue
-        with owner_lock(owner):
+        with owner_lock(chal, owner):
             # Read it again under the lock: between the listing and here, this
             # owner may have destroyed and rebuilt, and the new one is not ours
             # to take.
-            if not expired(owner):
+            if not expired(chal, owner):
                 continue
-            log.info("instance for %s expired, destroying", owner)
-            remove_instance(owner)
+            log.info("instance for %s/%s expired, destroying", chal, owner)
+            remove_instance(chal, owner)
     prune_orphan_networks()
 
 
-def expired(owner):
+def expired(chal, owner):
     try:
-        container = client().containers.get(container_name(owner))
+        container = client().containers.get(container_name(chal, owner))
     except NotFound:
         return False
     expires_at = instance_expires_at(container)
@@ -653,18 +1094,18 @@ def prune_orphan_networks():
     for network in client().networks.list():
         if not network.name.startswith(NETWORK_PREFIX):
             continue
-        owner = network.name[len(NETWORK_PREFIX):]
+        chal, owner = name_parts(network.name, NETWORK_PREFIX)
         # A create makes the network first and the container a moment later.
         # Without the owner's lock this is exactly the window in which an
         # instance being built looks like an orphan.
-        with owner_lock(owner):
+        with owner_lock(chal, owner):
             try:
-                client().containers.get(container_name(owner))
+                client().containers.get(container_name(chal, owner))
                 continue
             except NotFound:
                 pass
             log.info("removing orphan network %s", network.name)
-            detach_proxy(network)
+            detach_proxy(network, chal)
             try:
                 network.remove()
             except APIError as exc:
@@ -672,24 +1113,31 @@ def prune_orphan_networks():
 
 
 def destroy_all():
-    """Tear down every instance there is.
+    """Tear down every instance there is, then every proxy.
 
-    Each one still goes through its owner's lock, but only briefly: Docker's
-    grace period is short, and being late is worse than being rude to a create
-    that is already doomed. Callers who mean "we are going away" raise
+    Each instance still goes through its owner's lock, but only briefly:
+    Docker's grace period is short, and being late is worse than being rude to a
+    create that is already doomed. Callers who mean "we are going away" raise
     `shutting_down` first, so a create arriving now is turned away instead of
-    building something this walk has already passed.
+    building something this walk has already passed. The proxies go last, and
+    only once the networks they are attached to are gone.
     """
     for container in list_instances():
-        owner = instance_owner(container)
-        held = owner_lock(owner).acquire(timeout=SHUTDOWN_LOCK_WAIT)
+        chal, owner = instance_chal(container), instance_owner(container)
+        held = owner_lock(chal, owner).acquire(timeout=SHUTDOWN_LOCK_WAIT)
         try:
-            log.info("shutting down: destroying instance of %s", owner)
-            remove_instance(owner)
+            log.info("shutting down: destroying instance of %s/%s", chal, owner)
+            remove_instance(chal, owner)
         finally:
             if held:
-                owner_lock(owner).release()
+                owner_lock(chal, owner).release()
     prune_orphan_networks()
+    for container in list_proxies():
+        log.info("shutting down: removing %s", container.name)
+        try:
+            container.remove(force=True)
+        except APIError as exc:
+            log.error("could not remove %s: %s", container.name, exc)
 
 
 def handle_shutdown(signum, frame):
@@ -732,18 +1180,38 @@ def startup():
                     "are lost when the instancer restarts")
     if not PROXY_TOKEN:
         log.warning("PROXY_TOKEN not set: every key lookup is refused, so no player "
-                    "can get through the proxy")
-    build_image()
+                    "can get through any proxy")
+    if not CHALLENGES:
+        log.error("no usable challenge in %s: there is nothing to serve", CHALLENGES_DIR)
+    try:
+        control_network()
+    except NotFound:
+        log.error("no control network %r: the proxies would have nowhere to answer "
+                  "and no way back to this process -- is this running under "
+                  "docker-compose.yml?", CONTROL_NETWORK)
+        raise
+    build_image(PROXY_IMAGE, PROXY_DIR, "proxy")
+    remove_stale_proxies()
+    for chal in list(CHALLENGES.values()):
+        try:
+            build_image(chal.image, chal.dir, chal.id)
+            ensure_proxy(chal)
+        except (DockerException, OSError, RuntimeError) as exc:
+            # One challenge that will not build or will not get a proxy is not a
+            # reason for the others to stay down. Drop it and say so.
+            log.error("dropping challenge %s: %s", chal.id, exc)
+            del CHALLENGES[chal.id]
     for container in list_instances():
-        log.info("adopted instance of %s (%s), expires_at=%s", instance_owner(container),
+        log.info("adopted instance of %s/%s (%s), expires_at=%s",
+                 instance_chal(container), instance_owner(container),
                  container.status, instance_expires_at(container))
-    log.info("%s serving %r by %s (%s)", CONFIG["instancer_name"], CONFIG["chal_name"],
-             CONFIG["author"] or "nobody in particular", CONFIG["type"] or "no type")
-    log.info("server started on port %d (mode=%s, proxy %s:%d via %s, instance ports "
-             "%d-%d, subnet pool %s /%d, instance ttl %ds, reap on shutdown: %s)",
-             LISTEN_PORT, MODE, PROXY_HOST or "<this host>", PROXY_PORT, PROXY_CONTAINER,
-             INSTANCE_PORT_MIN, INSTANCE_PORT_MAX, SUBNET_POOL, SUBNET_PREFIX, DEFAULT_TTL,
-             "yes" if REAP_ON_SHUTDOWN else "no")
+    log.info("%s serving %d challenge(s)", CONFIG["instancer_name"], len(CHALLENGES))
+    for chal in CHALLENGES.values():
+        log.info("  %s on :%d (%s), ttl %ds, up to %d at once from %s in /%d",
+                 chal.id, chal.proxy_port, chal.mode, chal.ttl, chal.capacity,
+                 chal.subnet_pool, chal.subnet_prefix)
+    log.info("server started on port %d (control network %s, reap on shutdown: %s)",
+             LISTEN_PORT, CONTROL_NETWORK, "yes" if REAP_ON_SHUTDOWN else "no")
 
 
 if __name__ == "__main__":

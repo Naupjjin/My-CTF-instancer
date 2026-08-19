@@ -1,11 +1,8 @@
-# Names. Everything operational lives in docker-compose.yml as environment
-# variables; this file is only what gets *written* on the page.
-
-# The challenge, as players see it.
-chal_name: Special Love
-author: naup
-type: pwn
-
-# This deployment, as it introduces itself -- on the page and in the log when
-# the instancer comes up.
+# The instancer's own name, and nothing else: what the titlebar says, what the
+# boot banner says, and the first line in the log when it comes up.
+#
+# Everything about a *challenge* lives with that challenge, in
+# challenges/<id>/config.yml. Everything about this deployment lives in
+# docker-compose.yml as environment variables -- including the two secrets,
+# which is why they are not here.
 instancer_name: SpawnZero

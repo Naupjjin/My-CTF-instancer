@@ -1,19 +1,21 @@
-"""SpawnZero's proxy: the only door into an instance.
+"""The proxy: the only door into an instance of one challenge.
 
-Instances live on internal networks with no gateway, so nothing can route to
-them -- except this proxy, which the instancer attaches to every instance
-network as it creates one. A player arrives on the single published proxy port,
-hands over the key the instancer printed, and is spliced onto their own
-instance:
+One of these runs per challenge, created by the instancer and published on that
+challenge's own port. Instances live on internal networks with no gateway, so
+nothing can route to them -- except this proxy, which the instancer attaches to
+every instance network of its challenge as it creates one. A player arrives on
+the single published proxy port, hands over the key the instancer printed, and
+is spliced onto their own instance:
 
   netcat  the first line of the connection is the key
   http    the first path segment is the key, and a cookie remembers it so the
           challenge's own absolute links keep working afterwards
 
 The proxy stores nothing: every key is resolved by asking the instancer, which
-answers from the container labels. And it binds exactly one address -- the one
-on the control network -- so the instance networks it is attached to have
-nothing to connect back to.
+answers from the container labels -- and only ever about PROXY_CHAL, so a key
+that belongs to another challenge is a key this proxy cannot spend. And it binds
+exactly one address -- the one on the control network -- so the instance
+networks it is attached to have nothing to connect back to.
 """
 
 import http.cookies
@@ -33,8 +35,12 @@ import urllib.request
 PROXY_BIND = os.environ.get("PROXY_BIND", "0.0.0.0")
 PROXY_PORT = int(os.environ.get("PROXY_PORT", "1337"))
 
-# Where keys are resolved. The instancer is the only source of truth.
+# Where keys are resolved, which challenge to resolve them for, and what to show
+# to prove the asking is ours. All three come from the instancer, which created
+# this container: the token is this challenge's alone, so it buys nothing on any
+# other challenge's instances.
 INSTANCER_URL = os.environ.get("INSTANCER_URL", "http://instancer:5000").rstrip("/")
+PROXY_CHAL = os.environ.get("PROXY_CHAL", "")
 PROXY_TOKEN = os.environ.get("PROXY_TOKEN", "")
 
 CONNECT_TIMEOUT = int(os.environ.get("CONNECT_TIMEOUT", "5"))
@@ -63,8 +69,9 @@ def resolve(key):
     """Ask the instancer where a key leads. Returns (host, port), or None."""
     if not KEY_RE.match(key or ""):
         return None
-    lookup = urllib.request.Request("%s/internal/route/%s" % (INSTANCER_URL, key),
-                                    headers={"X-Proxy-Token": PROXY_TOKEN})
+    lookup = urllib.request.Request(
+        "%s/internal/route/%s/%s" % (INSTANCER_URL, PROXY_CHAL, key),
+        headers={"X-Proxy-Token": PROXY_TOKEN})
     try:
         with urllib.request.urlopen(lookup, timeout=CONNECT_TIMEOUT) as response:
             route = json.load(response)
@@ -141,7 +148,7 @@ def read_until(sock, terminator, limit):
 
 # --- netcat mode --------------------------------------------------------------
 
-PROMPT = b"spawnzero // paste the key your instance was created with\nkey: "
+PROMPT = b"paste the key your instance was created with\nkey: "
 NO_ROUTE = b"no instance for that key\n"
 
 
@@ -285,6 +292,8 @@ def serve(bind=None, port=None):
 def startup():
     if not PROXY_TOKEN:
         log.warning("PROXY_TOKEN not set: the instancer will refuse every lookup")
+    if not PROXY_CHAL:
+        log.warning("PROXY_CHAL not set: there is no challenge to resolve keys for")
     if PROXY_BIND in ("", "0.0.0.0", "::"):
         log.warning("PROXY_BIND is a wildcard: instances attached to this proxy can "
                     "reach it back -- bind the control network address instead")
@@ -293,6 +302,6 @@ def startup():
 if __name__ == "__main__":
     startup()
     server = serve()
-    log.info("proxy started on %s:%d (mode=%s, instancer %s)",
-             PROXY_BIND, PROXY_PORT, MODE, INSTANCER_URL)
+    log.info("proxy for %s started on %s:%d (mode=%s, instancer %s)",
+             PROXY_CHAL or "<no challenge>", PROXY_BIND, PROXY_PORT, MODE, INSTANCER_URL)
     server.serve_forever()

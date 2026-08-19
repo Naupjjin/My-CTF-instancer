@@ -103,7 +103,7 @@ class FakeAnswer(io.BytesIO):
         self.close()
 
 
-def test_resolve_asks_the_instancer_with_the_shared_token(monkeypatch):
+def test_resolve_asks_the_instancer_about_its_own_challenge(monkeypatch):
     seen = {}
 
     def fake_urlopen(lookup, timeout=None):
@@ -111,11 +111,14 @@ def test_resolve_asks_the_instancer_with_the_shared_token(monkeypatch):
         seen["token"] = lookup.get_header("X-proxy-token")
         return FakeAnswer(b'{"host": "10.240.0.1", "port": 30000}')
 
-    monkeypatch.setattr(proxy, "PROXY_TOKEN", "shared")
+    monkeypatch.setattr(proxy, "PROXY_CHAL", "cookie-jar")
+    monkeypatch.setattr(proxy, "PROXY_TOKEN", "ours")
     monkeypatch.setattr(proxy.urllib.request, "urlopen", fake_urlopen)
     assert proxy.resolve(KEY) == ("10.240.0.1", 30000)
-    assert seen["url"].endswith("/internal/route/" + KEY)
-    assert seen["token"] == "shared"
+    # a proxy only ever asks about the challenge it belongs to, with the token
+    # that belongs to that challenge
+    assert seen["url"].endswith("/internal/route/cookie-jar/" + KEY)
+    assert seen["token"] == "ours"
 
 
 def test_resolve_of_an_unknown_key_is_none(monkeypatch):

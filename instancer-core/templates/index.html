@@ -1,243 +1,39 @@
-<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{{ chal_name }} // {{ instancer_name }}</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&family=VT323&display=swap" rel="stylesheet">
-<style>
-  :root {
-    --paper:   #e9e7f1;   /* page: cool pale lavender-grey */
-    --card:    #fcfbff;   /* panel */
-    --ink:     #4b485e;   /* text + borders: soft slate-violet */
-    --ink-dim: #918fa6;   /* secondary text */
-    --accent:  #8a7fc7;   /* periwinkle (primary) */
-    --accent-s:#dad4f0;   /* pale periwinkle (shadows/fills) */
-    --sage:    #6fb39a;   /* online */
-    --sage-s:  #d3ebe0;
-    --rose:    #d98c9b;   /* offline / stop / critical */
-    --rose-s:  #f2dae0;
-    --amber:   #c6a15e;   /* warning */
-  }
+{% extends "base.html" %}
+{% block title %}{{ instancer_name }}{% endblock %}
 
-  * { box-sizing: border-box; }
-  html, body { height: 100%; }
-
-  body {
-    margin: 0;
-    background: var(--paper);
-    color: var(--ink);
-    font-family: 'VT323', ui-monospace, 'Courier New', monospace;
-    font-size: 22px;
-    line-height: 1.35;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    padding: 24px;
-    -webkit-font-smoothing: none;   /* keep type crisp / pixel-ish */
-    overflow: hidden;
-  }
-  .pixel { font-family: 'Press Start 2P', 'VT323', ui-monospace, monospace; }
-
-  /* soft retro texture: faint dither + faint scanlines, no harsh glow */
-  body::before {
-    content: ""; position: fixed; inset: 0; z-index: 40; pointer-events: none; opacity: .5;
-    background:
-      repeating-linear-gradient(0deg, rgba(75,72,94,.05) 0 1px, transparent 1px 3px),
-      repeating-conic-gradient(from 0deg, rgba(75,72,94,.04) 0% 25%, transparent 0% 50%) 0 0 / 4px 4px;
-  }
-  body::after {                        /* very gentle vignette in paper tone */
-    content: ""; position: fixed; inset: 0; z-index: 41; pointer-events: none;
-    background: radial-gradient(120% 120% at 50% 40%, transparent 60%, rgba(75,72,94,.08) 100%);
-  }
-
-  /* ---- panel ---- */
-  #frame {
-    position: relative; z-index: 10;
-    width: min(560px, 100%);
-    background: var(--card);
-    border: 3px solid var(--ink);
-    box-shadow: 8px 8px 0 var(--accent-s), 0 0 0 1px var(--card) inset;
-  }
-  #titlebar {
-    display: flex; align-items: center; justify-content: space-between;
-    padding: 10px 12px;
-    border-bottom: 3px solid var(--ink);
-    background: repeating-linear-gradient(90deg, var(--card) 0 8px, #f4f2fb 8px 16px);
-  }
-  .brand { font-size: 12px; color: var(--ink); }
-  .dots { display: flex; gap: 6px; }
-  .dots i { width: 11px; height: 11px; display: block; border: 2px solid var(--ink); }
-  .dots i.s { background: var(--sage);   }
-  .dots i.a { background: var(--accent); }
-  .dots i.r { background: var(--rose);   }
-
-  #screen { padding: 22px 22px 24px; min-height: 250px; }
-
-  #boot { white-space: pre-wrap; color: var(--ink-dim); min-height: 96px; font-size: 20px; }
-  #boot b { color: var(--accent); }
-
-  #console { opacity: 0; transition: opacity .25s steps(4); }
-  #console.on { opacity: 1; }
-
-  h1.pixel { font-size: 19px; margin: 2px 0 7px; color: var(--ink); letter-spacing: 1px; }
-  .sub { margin: 0 0 20px; }
-  .sub .tag { color: var(--accent); text-transform: uppercase; letter-spacing: 1px; }
-
-  .row { display: flex; align-items: baseline; gap: 12px; margin: 9px 0; flex-wrap: wrap; }
-  .lbl { color: var(--accent); font-size: 11px; min-width: 92px; }
-
-  #led { width: 13px; height: 13px; display: inline-block; border: 2px solid var(--ink);
-         background: var(--rose); }
-  #led.on { background: var(--sage); animation: blink 1.2s steps(1) infinite; }
-  @keyframes blink { 50% { opacity: .35; } }
-
-  #state { font-size: 11px; color: var(--rose); }
-  #state.online { color: var(--sage); }
-
-  .copy { color: var(--ink); text-decoration: none; word-break: break-all;
-          border-bottom: 2px dotted var(--accent); cursor: pointer; padding: 0 2px; }
-  .copy:hover { background: var(--accent-s); }
-  .prompt { color: var(--accent); }
-  .cursor { display: inline-block; width: 9px; height: 17px; background: var(--ink);
-            vertical-align: -3px; margin-left: 2px; animation: blink .9s steps(1) infinite; }
-
-  .clock { font-size: 30px; letter-spacing: 2px; color: var(--ink); }
-  .clock.warn { color: var(--amber); }
-  .clock.crit { color: var(--rose); animation: blink .7s steps(1) infinite; }
-
-  .muted { color: var(--ink-dim); font-size: 16px; }
-
-  /* ---- buttons: pale pixel blocks ---- */
-  #actions { margin-top: 24px; display: flex; gap: 14px; }
-  .btn {
-    display: inline-flex; align-items: center; gap: 10px;
-    font-family: 'Press Start 2P', monospace; font-size: 11px;
-    color: var(--ink); background: var(--card);
-    border: 3px solid var(--ink); padding: 13px 16px;
-    cursor: pointer; text-transform: uppercase; letter-spacing: 1px;
-    box-shadow: 4px 4px 0 var(--accent-s);
-  }
-  .btn .ico { width: 11px; height: 11px; display: inline-block; border: 2px solid var(--ink); background: var(--accent); }
-  .btn:hover { background: var(--accent); color: var(--card); box-shadow: 4px 4px 0 var(--ink); }
-  .btn:hover .ico { background: var(--card); }
-  .btn:active { transform: translate(4px,4px); box-shadow: 0 0 0; }
-  .btn:disabled { opacity: .4; cursor: not-allowed; box-shadow: 4px 4px 0 #e6e4ee; }
-  .btn.danger { border-color: var(--rose); color: var(--rose); box-shadow: 4px 4px 0 var(--rose-s); }
-  .btn.danger .ico { border-color: var(--rose); background: var(--rose); }
-  .btn.danger:hover { background: var(--rose); color: var(--card); box-shadow: 4px 4px 0 var(--ink); }
-  .btn.danger:hover .ico { background: var(--card); }
-
-  #error { color: var(--rose); font-size: 16px; margin-top: 14px; min-height: 20px; }
-  #error:not(:empty)::before { content: ":: "; }
-
-  /* gentle glitch on the wordmark only, in soft accents */
-  .glitch { position: relative; }
-  .glitch::before, .glitch::after {
-    content: attr(data-text); position: absolute; left: 0; top: 0; width: 100%; overflow: hidden;
-  }
-  .glitch::before { color: var(--accent); transform: translate(-1px,0); animation: gb 4s infinite steps(2); opacity: .5; }
-  .glitch::after  { color: var(--sage);   transform: translate(1px,0);  animation: gr 5s infinite steps(2); opacity: .5; }
-  @keyframes gb { 0%,94%,100%{clip-path:inset(0 0 100% 0)} 95%{clip-path:inset(15% 0 55% 0)} 98%{clip-path:inset(45% 0 25% 0)} }
-  @keyframes gr { 0%,93%,100%{clip-path:inset(100% 0 0 0)} 96%{clip-path:inset(60% 0 20% 0)} }
-
-  @media (prefers-reduced-motion: reduce) {
-    #led.on, .glitch::before, .glitch::after, .clock.crit { animation: none; }
-  }
-</style>
-</head>
-<body>
-<div id="frame">
-  <div id="titlebar">
-    <span class="brand pixel glitch" data-text="{{ instancer_name|upper }}">{{ instancer_name|upper }}</span>
-    <span class="dots"><i class="s"></i><i class="a"></i><i class="r"></i></span>
-  </div>
-
-  <div id="screen">
+{% block screen %}
     <div id="boot"></div>
 
     <div id="console">
-      <h1 class="pixel">{{ chal_name|upper }}</h1>
-      {% if type or author %}
-      <div class="sub muted">
-        {%- if type %}<span class="tag">{{ type }}</span>{% endif -%}
-        {%- if type and author %} // {% endif -%}
-        {%- if author %}by {{ author }}{% endif -%}
+      <h1 class="pixel">CHALLENGES</h1>
+      <div class="sub muted">one instance each, yours alone, for as long as its clock says</div>
+
+      {% if challenges %}
+      <div class="list">
+        {% for c in challenges %}
+        <a class="chal" href="/c/{{ c.id }}" data-chal="{{ c.id }}">
+          <span class="led"></span>
+          <span class="name">{{ c.name }}{% if c.author %} <span class="muted">by {{ c.author }}</span>{% endif %}</span>
+          {% if c.type %}<span class="type">{{ c.type }}</span>{% endif %}
+          <span class="when">--</span>
+        </a>
+        {% endfor %}
       </div>
+      {% else %}
+      <p class="empty">nothing is being served. drop a challenge directory in and
+      restart the instancer.</p>
       {% endif %}
-
-      <div class="row">
-        <span class="lbl pixel">STATUS</span>
-        <span id="led"></span>
-        <span id="state" class="pixel">OFFLINE</span>
-      </div>
-
-      <div class="row" id="addr-row" hidden>
-        <span class="lbl pixel">ADDR</span>
-        <span><span class="prompt">&gt;</span> <a id="address" class="copy"></a></span>
-      </div>
-
-      <div class="row" id="key-row" hidden>
-        <span class="lbl pixel">KEY</span>
-        <span><span class="prompt">&gt;</span> <a id="key" class="copy"></a></span>
-      </div>
-
-      <div class="row" id="hint-row" hidden>
-        <span class="lbl pixel"></span>
-        <span class="muted" id="hint"></span>
-      </div>
-
-      <div class="row" id="ttl-row" hidden>
-        <span class="lbl pixel">EXPIRES</span>
-        <span id="remaining" class="clock">--:--</span>
-      </div>
-
-      <div class="row">
-        <span class="lbl pixel">LIFETIME</span>
-        <span class="muted"><span id="ttlcfg">--</span>s per instance</span>
-      </div>
-
-      <div id="actions">
-        <button id="start" class="btn" hidden><i class="ico"></i>START</button>
-        <button id="stop" class="btn danger" hidden><i class="ico"></i>STOP</button>
-      </div>
-
-      <div id="error"></div>
     </div>
-  </div>
-</div>
+{% endblock %}
 
+{% block script %}
 <script>
-// Injected by Flask. The instance lifetime and the proxy address are decided by
-// the server (docker-compose); an empty PROXY_HOST means "the host serving this
-// page".
+// The list is rendered by Flask; this only keeps the lamps honest -- which of
+// these you have running right now, and how long is left on it.
 const INSTANCER_NAME = {{ instancer_name|tojson }};
-const MODE = {{ mode|tojson }};
-const DEFAULT_TTL = {{ default_ttl }};
-const PROXY_HOST = {{ proxy_host|tojson }};
-const PROXY_PORT = {{ proxy_port }};
 
 const boot = document.getElementById("boot");
 const term = document.getElementById("console");
-const led = document.getElementById("led");
-const state = document.getElementById("state");
-const addrRow = document.getElementById("addr-row");
-const address = document.getElementById("address");
-const keyRow = document.getElementById("key-row");
-const key = document.getElementById("key");
-const hintRow = document.getElementById("hint-row");
-const hint = document.getElementById("hint");
-const ttlRow = document.getElementById("ttl-row");
-const remaining = document.getElementById("remaining");
-const ttlcfg = document.getElementById("ttlcfg");
-const start = document.getElementById("start");
-const stop = document.getElementById("stop");
-const error = document.getElementById("error");
-
-ttlcfg.textContent = DEFAULT_TTL;
-let countdown = null;
 
 /* ---------- boot sequence (typewriter, runs once) ---------- */
 const BOOT_LINES = [
@@ -262,89 +58,32 @@ function typewriter(lines, done) {
   })();
 }
 
-/* ---------- rendering ---------- */
-function formatAddress(mode, host, port, key) {
-  // Everything goes through the one proxy port; the key says which instance.
-  if (mode === "netcat") return { text: "nc " + host + " " + port, href: null };
-  const url = "http://" + host + ":" + port + "/" + key + "/";
-  return { text: url, href: url };
-}
-const HINTS = {
-  netcat: "connect, then paste the key at the prompt",
-  http:   "the link carries the key; a cookie keeps it after that",
-};
+/* ---------- lamps ---------- */
 function fmt(sec) {
   sec = Math.max(0, sec);
   const m = Math.floor(sec / 60), s = sec % 60;
   return String(m).padStart(2, "0") + ":" + String(s).padStart(2, "0");
 }
-function runClock(sec) {
-  if (countdown) clearInterval(countdown);
-  let left = sec;
-  const tick = () => {
-    remaining.textContent = fmt(left);
-    remaining.className = "clock" + (left <= 10 ? " crit" : left <= 60 ? " warn" : "");
-    if (left <= 0) { clearInterval(countdown); refresh(); }
-    left -= 1;
-  };
-  tick();
-  countdown = setInterval(tick, 1000);
-}
-function render(data) {
-  if (data.running) {
-    const mode = data.mode || MODE;
-    const host = data.proxy_host || location.hostname;
-    const a = formatAddress(mode, host, data.proxy_port || PROXY_PORT, data.key);
-    led.classList.add("on");
-    state.textContent = "ONLINE"; state.classList.add("online");
-    address.textContent = a.text;
-    if (a.href) { address.href = a.href; address.target = "_blank"; }
-    else { address.removeAttribute("href"); address.title = "click to copy"; }
-    key.textContent = data.key || "";
-    key.title = "click to copy";
-    hint.textContent = HINTS[mode] || "";
-    addrRow.hidden = false; keyRow.hidden = false; hintRow.hidden = false;
-    if (typeof data.remaining_time === "number") { ttlRow.hidden = false; runClock(data.remaining_time); }
-    start.hidden = true; stop.hidden = false;
-  } else {
-    if (countdown) { clearInterval(countdown); countdown = null; }
-    led.classList.remove("on");
-    state.textContent = "OFFLINE"; state.classList.remove("online");
-    addrRow.hidden = true; keyRow.hidden = true; hintRow.hidden = true;
-    ttlRow.hidden = true;
-    start.hidden = false; stop.hidden = true;
+async function refresh() {
+  let data;
+  try { data = await (await fetch("/api/challenges")).json(); }
+  catch (e) { return; }
+  for (const c of data.challenges) {
+    const row = document.querySelector('[data-chal="' + CSS.escape(c.chal) + '"]');
+    if (!row) continue;
+    row.querySelector(".led").classList.toggle("on", c.running);
+    const when = row.querySelector(".when");
+    when.classList.toggle("on", c.running);
+    when.textContent = c.running && typeof c.remaining_time === "number"
+      ? fmt(c.remaining_time) : (c.running ? "up" : "--");
   }
 }
 
-/* ---------- API ---------- */
-async function call(path, method) {
-  start.disabled = stop.disabled = true;
-  error.textContent = "";
-  try {
-    const r = await fetch(path, { method });
-    const data = await r.json();
-    if (data.error) error.textContent = data.error;
-    render(data);
-  } catch (e) { error.textContent = String(e); }
-  start.disabled = stop.disabled = false;
-}
-const refresh = () => call("/status", "GET");
-start.onclick = () => call("/create", "POST");   // lifetime is the server's DEFAULT_TTL
-stop.onclick  = () => call("/destroy", "POST");
-
-// click a copyable field (the netcat address, the key) to put it on the clipboard
-document.querySelectorAll(".copy").forEach((el) => {
-  el.addEventListener("click", (e) => {
-    if (el.hasAttribute("href")) return;   // a real link: let it open
-    e.preventDefault();
-    navigator.clipboard && navigator.clipboard.writeText(el.textContent);
-    const old = el.textContent; el.textContent = "[COPIED]";
-    setTimeout(() => { el.textContent = old; }, 700);
-  });
-});
-
 /* ---------- go ---------- */
-typewriter(BOOT_LINES, () => { term.classList.add("on"); refresh(); });
+typewriter(BOOT_LINES, () => {
+  term.classList.add("on");
+  refresh();
+  setInterval(refresh, 5000);   // a list, not a countdown: slow is fine
+});
 </script>
-</body>
-</html>
+{% endblock %}

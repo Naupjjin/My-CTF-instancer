@@ -1,0 +1,14 @@
+# Run the challenge on its own, the way the instancer will run it: straight from
+# the image, with no volumes to mask what was built, and on a port that is NOT
+# the image's default -- so a challenge that ignores $CHAL_PORT fails here, where
+# you are looking, instead of in front of players.
+#
+#   docker compose -f challenges/cookie-jar/docker-compose.yml up --build
+#   xdg-open http://localhost:30001
+services:
+  web-cookie-jar:
+    build: ./
+    environment:
+      CHAL_PORT: 30001
+    ports:
+      - 30001:30001

@@ -1,63 +1,128 @@
 {% extends "base.html" %}
 {% block title %}{{ chal.name }} // {{ instancer_name }}{% endblock %}
+{% block chip %}{{ chal.mode|upper }} :{{ chal.proxy_port }}{% endblock %}
+
+{% block style %}
+  /* ---- the head of the panel: mark, name, lamp ---- */
+  .head { display: flex; align-items: center; gap: 14px; }
+  .head .who { flex: 1; min-width: 0; }
+  .head .lamp { display: flex; align-items: center; gap: 8px; flex: none; }
+  #state { font-family: 'Press Start 2P', monospace; font-size: 9px; color: var(--rose);
+           letter-spacing: 1px; }
+  #state.online { color: var(--sage); }
+  #state.busy { color: var(--amber); }
+
+  /* ---- the clock, in segments ---- */
+  .meter { margin: 4px 0 0; }
+  .meter .face {
+    border: 3px solid var(--ink); background: var(--card);
+    padding: 16px 12px 14px; text-align: center; position: relative;
+    box-shadow: inset 0 0 0 3px var(--card), inset 0 0 0 5px var(--tone-s);
+  }
+  /* the segments that are always there, lit or not -- an LCD, not a screen */
+  .digits { position: relative; line-height: 1.1; }
+  .digits .ghost, #remaining {
+    font-family: 'Press Start 2P', monospace; font-size: 34px; letter-spacing: 6px;
+    display: block; line-height: 1.1;
+  }
+  .digits .ghost { position: absolute; inset: 0; color: var(--ink); opacity: .13; }
+  #remaining { position: relative; color: var(--ink); }
+  #remaining.warn { color: var(--amber); }
+  #remaining.crit { color: var(--rose); animation: blink .7s steps(1) infinite; }
+  #remaining.idle { color: var(--accent-s); }
+  .meter .cap {
+    font-family: 'Press Start 2P', monospace; font-size: 8px; letter-spacing: 1px;
+    color: var(--ink-dim); margin-top: 10px; display: flex; justify-content: space-between;
+  }
+  .meter .bar { margin-top: 10px; }
+
+  /* ---- how to get in: a terminal, because that is what it is ---- */
+  .term {
+    border: 3px solid var(--ink); background: #f6f4fc; padding: 14px 14px 12px;
+    box-shadow: 5px 5px 0 var(--tone-s);
+  }
+  .term .line { display: flex; gap: 8px; align-items: baseline; margin: 3px 0; }
+  .term .prompt { color: var(--tone); flex: none; }
+  .copy { color: var(--ink); text-decoration: none; word-break: break-all;
+          border-bottom: 2px dotted var(--accent); cursor: pointer; padding: 0 2px; }
+  .copy:hover { background: var(--accent-s); }
+  .term .note { color: var(--ink-dim); font-size: 15px; margin: 8px 0 0; }
+  .term.idle { border-style: dashed; box-shadow: none; background: transparent; }
+  .term.idle .line { color: var(--ink-dim); }
+
+  #actions { margin-top: 20px; display: flex; gap: 14px; }
+{% endblock %}
 
 {% block screen %}
-    <div id="console" class="on">
-      <h1 class="pixel">{{ chal.name|upper }}</h1>
-      {% if chal.type or chal.author %}
-      <div class="sub muted">
-        {%- if chal.type %}<span class="tag">{{ chal.type }}</span>{% endif -%}
-        {%- if chal.type and chal.author %} // {% endif -%}
-        {%- if chal.author %}by {{ chal.author }}{% endif -%}
-      </div>
-      {% endif %}
-
-      <div class="row">
-        <span class="lbl pixel">STATUS</span>
-        <span id="led" class="led"></span>
-        <span id="state" class="pixel">OFFLINE</span>
-      </div>
-
-      <div class="row" id="addr-row" hidden>
-        <span class="lbl pixel">ADDR</span>
-        <span><span class="prompt">&gt;</span> <a id="address" class="copy"></a></span>
-      </div>
-
-      <div class="row" id="key-row" hidden>
-        <span class="lbl pixel">KEY</span>
-        <span><span class="prompt">&gt;</span> <a id="key" class="copy"></a></span>
+    <div id="console" class="on" data-type="{{ chal.type|lower }}">
+      <div class="head">
+        <span class="sigil lg">
+          {%- for row in chal.sigil %}{% for cell in row %}<i class="{{ 'on' if cell }}"></i>{% endfor %}{% endfor -%}
+        </span>
+        <span class="who">
+          <h1 class="pixel">{{ chal.name|upper }}</h1>
+          {% if chal.type or chal.author %}
+          <div class="sub muted">
+            {%- if chal.type %}<span class="tag">{{ chal.type }}</span>{% endif -%}
+            {%- if chal.type and chal.author %} // {% endif -%}
+            {%- if chal.author %}by {{ chal.author }}{% endif -%}
+          </div>
+          {% endif %}
+        </span>
+        <span class="lamp">
+          <span id="led" class="led"></span>
+          <span id="state">OFFLINE</span>
+        </span>
       </div>
 
-      <div class="row" id="hint-row" hidden>
-        <span class="lbl pixel"></span>
-        <span class="muted" id="hint"></span>
+      <div class="rule">LEASE<span class="fill"></span></div>
+      <div class="meter">
+        <div class="face">
+          <div class="digits">
+            <span class="ghost" aria-hidden="true">88:88</span>
+            <span id="remaining" class="idle">--:--</span>
+          </div>
+          <div class="bar" id="ttlbar"><i></i></div>
+          <div class="cap">
+            <span>{{ chal.ttl }}S PER INSTANCE</span>
+            <span>UP TO {{ chal.capacity }} AT ONCE</span>
+          </div>
+        </div>
       </div>
 
-      <div class="row" id="ttl-row" hidden>
-        <span class="lbl pixel">EXPIRES</span>
-        <span id="remaining" class="clock">--:--</span>
-      </div>
-
-      <div class="row">
-        <span class="lbl pixel">LIFETIME</span>
-        <span class="muted"><span id="ttlcfg">--</span>s per instance</span>
+      <div class="rule">CONNECT<span class="fill"></span></div>
+      <div class="term idle" id="term">
+        <div class="line" id="addr-row">
+          <span class="prompt">&gt;</span>
+          <span id="address">press start and this fills in</span>
+        </div>
+        <div class="line" id="key-row" hidden>
+          <span class="prompt">key</span>
+          <a id="key" class="copy"></a>
+        </div>
+        <p class="note" id="hint" hidden></p>
       </div>
 
       <div id="actions">
         <button id="start" class="btn" hidden><i class="ico"></i>START</button>
         <button id="stop" class="btn danger" hidden><i class="ico"></i>STOP</button>
       </div>
+      <div class="keys">
+        <span><kbd>S</kbd>start</span>
+        <span><kbd>X</kbd>stop</span>
+        <span><kbd>C</kbd>copy key</span>
+      </div>
 
       <div id="error"></div>
-      <a class="back pixel" href="/">&lt; back to the list</a>
+      <a class="back" href="/">&lt; BACK TO THE RACK</a>
     </div>
 {% endblock %}
 
 {% block script %}
 <script>
-// Injected by Flask. The instance lifetime and the proxy address are this
-// challenge's own (challenges/{{ chal.id }}/config.yml); an empty PROXY_HOST
-// means "the host serving this page".
+// Injected by Flask. The lifetime and the proxy address are this challenge's own
+// (challenges/{{ chal.id }}/config.yml); an empty PROXY_HOST means "the host
+// serving this page".
 const CHAL = {{ chal.id|tojson }};
 const MODE = {{ chal.mode|tojson }};
 const TTL = {{ chal.ttl }};
@@ -66,21 +131,19 @@ const PROXY_PORT = {{ chal.proxy_port }};
 
 const led = document.getElementById("led");
 const state = document.getElementById("state");
-const addrRow = document.getElementById("addr-row");
+const term = document.getElementById("term");
 const address = document.getElementById("address");
 const keyRow = document.getElementById("key-row");
 const key = document.getElementById("key");
-const hintRow = document.getElementById("hint-row");
 const hint = document.getElementById("hint");
-const ttlRow = document.getElementById("ttl-row");
 const remaining = document.getElementById("remaining");
-const ttlcfg = document.getElementById("ttlcfg");
+const ttlbar = document.getElementById("ttlbar");
 const start = document.getElementById("start");
 const stop = document.getElementById("stop");
 const error = document.getElementById("error");
 
-ttlcfg.textContent = TTL;
 let countdown = null;
+let running = false;
 
 /* ---------- rendering ---------- */
 function formatAddress(mode, host, port, key) {
@@ -104,7 +167,10 @@ function runClock(sec) {
   let left = sec;
   const tick = () => {
     remaining.textContent = fmt(left);
-    remaining.className = "clock" + (left <= 10 ? " crit" : left <= 60 ? " warn" : "");
+    remaining.className = left <= 10 ? "crit" : left <= 60 ? "warn" : "";
+    const share = Math.max(0, Math.min(1, left / TTL));
+    ttlbar.firstElementChild.style.width = (share * 100).toFixed(1) + "%";
+    ttlbar.className = "bar" + (left <= 60 ? " crit" : left <= 300 ? " warn" : "");
     if (left <= 0) { clearInterval(countdown); refresh(); }
     left -= 1;
   };
@@ -112,35 +178,47 @@ function runClock(sec) {
   countdown = setInterval(tick, 1000);
 }
 function render(data) {
-  if (data.running) {
+  running = !!data.running;
+  if (running) {
     const mode = data.mode || MODE;
     const host = data.proxy_host || location.hostname;
     const a = formatAddress(mode, host, data.proxy_port || PROXY_PORT, data.key);
-    led.classList.add("on");
-    state.textContent = "ONLINE"; state.classList.add("online");
+    led.className = "led on";
+    state.textContent = "ONLINE"; state.className = "online";
+    term.className = "term";
     address.textContent = a.text;
+    address.className = "copy";
     if (a.href) { address.href = a.href; address.target = "_blank"; }
     else { address.removeAttribute("href"); address.title = "click to copy"; }
     key.textContent = data.key || "";
     key.title = "click to copy";
     hint.textContent = HINTS[mode] || "";
-    addrRow.hidden = false; keyRow.hidden = false; hintRow.hidden = false;
-    if (typeof data.remaining_time === "number") { ttlRow.hidden = false; runClock(data.remaining_time); }
+    keyRow.hidden = false; hint.hidden = false;
+    if (typeof data.remaining_time === "number") runClock(data.remaining_time);
     start.hidden = true; stop.hidden = false;
   } else {
     if (countdown) { clearInterval(countdown); countdown = null; }
-    led.classList.remove("on");
-    state.textContent = "OFFLINE"; state.classList.remove("online");
-    addrRow.hidden = true; keyRow.hidden = true; hintRow.hidden = true;
-    ttlRow.hidden = true;
+    led.className = "led";
+    state.textContent = "OFFLINE"; state.className = "";
+    term.className = "term idle";
+    address.textContent = "press start and this fills in";
+    address.removeAttribute("href"); address.className = "";
+    keyRow.hidden = true; hint.hidden = true;
+    remaining.textContent = "--:--"; remaining.className = "idle";
+    ttlbar.firstElementChild.style.width = "0%";
+    ttlbar.className = "bar";
     start.hidden = false; stop.hidden = true;
   }
 }
 
 /* ---------- API ---------- */
-async function call(path, method) {
+async function call(path, method, working) {
   start.disabled = stop.disabled = true;
   error.textContent = "";
+  if (working) {
+    led.className = "led busy";
+    state.textContent = working; state.className = "busy";
+  }
   try {
     const r = await fetch("/api/" + encodeURIComponent(CHAL) + path, { method });
     const data = await r.json();
@@ -150,18 +228,26 @@ async function call(path, method) {
   start.disabled = stop.disabled = false;
 }
 const refresh = () => call("/status", "GET");
-start.onclick = () => call("/create", "POST");   // lifetime is this challenge's ttl
-stop.onclick  = () => call("/destroy", "POST");
+start.onclick = () => call("/create", "POST", "SPAWNING");   // lifetime is this challenge's ttl
+stop.onclick  = () => call("/destroy", "POST", "STOPPING");
+
+// the same three things, for people who never touch the mouse
+document.addEventListener("keydown", (e) => {
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  const k = e.key.toLowerCase();
+  if (k === "s" && !start.hidden && !start.disabled) start.click();
+  else if (k === "x" && !stop.hidden && !stop.disabled) stop.click();
+  else if (k === "c" && running) key.click();
+});
 
 // click a copyable field (the netcat address, the key) to put it on the clipboard
-document.querySelectorAll(".copy").forEach((el) => {
-  el.addEventListener("click", (e) => {
-    if (el.hasAttribute("href")) return;   // a real link: let it open
-    e.preventDefault();
-    navigator.clipboard && navigator.clipboard.writeText(el.textContent);
-    const old = el.textContent; el.textContent = "[COPIED]";
-    setTimeout(() => { el.textContent = old; }, 700);
-  });
+document.addEventListener("click", (e) => {
+  const el = e.target.closest(".copy");
+  if (!el || el.hasAttribute("href")) return;   // a real link: let it open
+  e.preventDefault();
+  navigator.clipboard && navigator.clipboard.writeText(el.textContent);
+  const old = el.textContent; el.textContent = "[COPIED]";
+  setTimeout(() => { el.textContent = old; }, 700);
 });
 
 /* ---------- go ---------- */

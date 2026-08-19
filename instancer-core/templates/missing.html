@@ -1,10 +1,17 @@
 {% extends "base.html" %}
 {% block title %}not here // {{ instancer_name }}{% endblock %}
+{% block chip %}404{% endblock %}
+
+{% block style %}
+  .lost { font-family: 'Press Start 2P', monospace; font-size: 48px; color: var(--accent-s);
+          letter-spacing: 8px; margin: 10px 0 18px; }
+{% endblock %}
 
 {% block screen %}
     <div id="console" class="on">
+      <div class="lost">404</div>
       <h1 class="pixel">NO SUCH CHALLENGE</h1>
-      <div class="sub muted">nothing here answers to <b>{{ chal }}</b>.</div>
-      <a class="back pixel" href="/">&lt; back to the list</a>
+      <div class="sub muted">nothing here answers to <b>{{ chal }}</b>.<span class="cursor"></span></div>
+      <a class="back" href="/">&lt; BACK TO THE RACK</a>
     </div>
 {% endblock %}

@@ -226,6 +226,7 @@ class Challenge:
         self.port_min, self.port_max = config["instance_ports"]
         self.image = CHALLENGE_IMAGE.format(chal=cid)
         self.proxy = PROXY_NAME.format(chal=cid)
+        self.sigil = sigil(cid)
 
     @property
     def capacity(self):
@@ -234,6 +235,22 @@ class Challenge:
 
     def __repr__(self):
         return "<Challenge %s on :%d (%s)>" % (self.id, self.proxy_port, self.mode)
+
+
+def sigil(cid):
+    """A 5x5 pixel mark for a challenge, in the shape of its id.
+
+    Mirrored down the middle, like the badges stamped on a cartridge label:
+    the same id always draws the same mark, and no two ids draw the same one
+    often enough to matter. Purely something to look at -- but the id is what it
+    looks at, which is the thing that is actually load-bearing here.
+    """
+    bits = [byte & 1 for byte in hashlib.sha256(cid.encode()).digest()[:15]]
+    rows = []
+    for row in range(5):
+        half = bits[row * 3:row * 3 + 3]
+        rows.append(half + half[1::-1])
+    return rows
 
 
 # What a challenge's config.yml may say, and what it means when it does not.

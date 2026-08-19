@@ -1,21 +1,67 @@
 {% extends "base.html" %}
 {% block title %}{{ instancer_name }}{% endblock %}
+{% block chip %}{{ challenges|length }} CHALLENGES{% endblock %}
+
+{% block style %}
+  /* ---- the rack: one card per challenge ---- */
+  .rack { display: flex; flex-direction: column; gap: 12px; }
+  .chal {
+    display: grid; grid-template-columns: auto 1fr auto; gap: 0 14px; align-items: center;
+    padding: 12px; text-decoration: none; color: var(--ink);
+    border: 3px solid var(--ink); background: var(--card);
+    box-shadow: 5px 5px 0 var(--tone-s);
+    transition: transform .08s steps(2), box-shadow .08s steps(2);
+  }
+  .chal:hover { transform: translate(-2px,-2px); box-shadow: 7px 7px 0 var(--tone); }
+  .chal:active { transform: translate(3px,3px); box-shadow: 2px 2px 0 var(--tone); }
+  .chal .sigil { grid-row: 1 / span 3; }
+  .chal .name { font-size: 24px; line-height: 1.1; }
+  .chal .meta { font-size: 15px; color: var(--ink-dim); }
+  .chal .meta b { color: var(--tone); font-weight: normal; text-transform: uppercase;
+                  letter-spacing: 1px; font-size: 13px; }
+  .chal .state {
+    grid-row: 1 / span 2; grid-column: 3; text-align: right; white-space: nowrap;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .chal .when { font-size: 22px; color: var(--ink-dim); letter-spacing: 1px; }
+  .chal .when.on { color: var(--sage); }
+  .chal .bar { grid-column: 2 / span 2; margin-top: 8px; }
+  .chal .reach {
+    grid-column: 2 / span 2; margin-top: 6px; font-size: 15px; color: var(--ink-dim);
+    display: flex; justify-content: space-between; gap: 10px;
+  }
+  .chal .reach .cap { color: var(--accent); }
+  .empty { color: var(--ink-dim); border: 3px dotted var(--accent-s); padding: 18px; }
+{% endblock %}
 
 {% block screen %}
     <div id="boot"></div>
 
     <div id="console">
-      <h1 class="pixel">CHALLENGES</h1>
-      <div class="sub muted">one instance each, yours alone, for as long as its clock says</div>
+      <div class="rule">CHALLENGES<span class="fill"></span><span class="count" id="tally">--</span></div>
 
       {% if challenges %}
-      <div class="list">
+      <div class="rack">
         {% for c in challenges %}
-        <a class="chal" href="/c/{{ c.id }}" data-chal="{{ c.id }}">
-          <span class="led"></span>
-          <span class="name">{{ c.name }}{% if c.author %} <span class="muted">by {{ c.author }}</span>{% endif %}</span>
-          {% if c.type %}<span class="type">{{ c.type }}</span>{% endif %}
-          <span class="when">--</span>
+        <a class="chal" href="/c/{{ c.id }}" data-chal="{{ c.id }}" data-type="{{ c.type|lower }}">
+          <span class="sigil">
+            {%- for row in c.sigil %}{% for cell in row %}<i class="{{ 'on' if cell }}"></i>{% endfor %}{% endfor -%}
+          </span>
+          <span class="name">{{ c.name }}</span>
+          <span class="state">
+            <span class="led"></span>
+            <span class="when">--:--</span>
+          </span>
+          <span class="meta">
+            {%- if c.type %}<b>{{ c.type }}</b>{% endif -%}
+            {%- if c.type and c.author %} // {% endif -%}
+            {%- if c.author %}by {{ c.author }}{% endif -%}
+          </span>
+          <span class="bar"><i></i></span>
+          <span class="reach">
+            <span>{{ 'nc' if c.mode == 'netcat' else 'http' }} :{{ c.proxy_port }}</span>
+            <span class="cap">{{ c.ttl }}s each &middot; up to {{ c.capacity }} at once</span>
+          </span>
         </a>
         {% endfor %}
       </div>
@@ -28,12 +74,15 @@
 
 {% block script %}
 <script>
-// The list is rendered by Flask; this only keeps the lamps honest -- which of
-// these you have running right now, and how long is left on it.
+// The rack is rendered by Flask; this only keeps the lamps honest -- which of
+// these you have running right now, and how long is left on each.
 const INSTANCER_NAME = {{ instancer_name|tojson }};
+const TTL = {{ challenges|map(attribute='ttl')|list|tojson }};
+const IDS = {{ challenges|map(attribute='id')|list|tojson }};
 
 const boot = document.getElementById("boot");
 const term = document.getElementById("console");
+const tally = document.getElementById("tally");
 
 /* ---------- boot sequence (typewriter, runs once) ---------- */
 const BOOT_LINES = [
@@ -64,26 +113,53 @@ function fmt(sec) {
   const m = Math.floor(sec / 60), s = sec % 60;
   return String(m).padStart(2, "0") + ":" + String(s).padStart(2, "0");
 }
+// Whatever the server last said, ticked down locally between polls so the
+// clocks move like clocks instead of jumping every five seconds.
+const live = {};
+function paint() {
+  let up = 0;
+  for (const id of IDS) {
+    const row = document.querySelector('[data-chal="' + CSS.escape(id) + '"]');
+    if (!row) continue;
+    const left = live[id];
+    const running = typeof left === "number";
+    if (running) up += 1;
+    row.querySelector(".led").classList.toggle("on", running);
+    const when = row.querySelector(".when");
+    when.classList.toggle("on", running);
+    when.textContent = running ? fmt(left) : "--:--";
+    const ttl = TTL[IDS.indexOf(id)] || 1;
+    const bar = row.querySelector(".bar");
+    const share = running ? Math.max(0, Math.min(1, left / ttl)) : 0;
+    bar.firstElementChild.style.width = (share * 100).toFixed(1) + "%";
+    bar.classList.toggle("warn", running && left <= 300);
+    bar.classList.toggle("crit", running && left <= 60);
+  }
+  tally.textContent = up ? up + " ONLINE" : "NONE RUNNING";
+}
 async function refresh() {
   let data;
   try { data = await (await fetch("/api/challenges")).json(); }
   catch (e) { return; }
   for (const c of data.challenges) {
-    const row = document.querySelector('[data-chal="' + CSS.escape(c.chal) + '"]');
-    if (!row) continue;
-    row.querySelector(".led").classList.toggle("on", c.running);
-    const when = row.querySelector(".when");
-    when.classList.toggle("on", c.running);
-    when.textContent = c.running && typeof c.remaining_time === "number"
-      ? fmt(c.remaining_time) : (c.running ? "up" : "--");
+    live[c.chal] = c.running && typeof c.remaining_time === "number"
+      ? c.remaining_time : (c.running ? 0 : undefined);
   }
+  paint();
+}
+function tickDown() {
+  for (const id of Object.keys(live)) {
+    if (typeof live[id] === "number" && live[id] > 0) live[id] -= 1;
+  }
+  paint();
 }
 
 /* ---------- go ---------- */
 typewriter(BOOT_LINES, () => {
   term.classList.add("on");
   refresh();
-  setInterval(refresh, 5000);   // a list, not a countdown: slow is fine
+  setInterval(refresh, 10000);   // the truth, now and then
+  setInterval(tickDown, 1000);   // and a clock in between
 });
 </script>
 {% endblock %}

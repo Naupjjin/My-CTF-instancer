@@ -19,21 +19,27 @@
     --sage-s:  #d3ebe0;
     --rose:    #d98c9b;   /* offline / stop / critical */
     --rose-s:  #f2dae0;
-    --amber:   #c6a15e;   /* warning */
+    --amber:   #c6a15e;   /* warning / working */
+    --amber-s: #efe0c4;
+
+    /* the accent a single challenge is drawn in; set per card by its type */
+    --tone:    var(--accent);
+    --tone-s:  var(--accent-s);
   }
 
   * { box-sizing: border-box; }
-  html, body { min-height: 100%; }
+  [hidden] { display: none !important; }   /* an author `display` outranks the UA rule */
 
   body {
     margin: 0;
+    min-height: 100vh;      /* so `margin: auto` on the frame has room to centre in */
     background: var(--paper);
     color: var(--ink);
     font-family: 'VT323', ui-monospace, 'Courier New', monospace;
     font-size: 22px;
     line-height: 1.35;
     display: flex;
-    padding: 24px;
+    padding: 24px 24px 40px;
     -webkit-font-smoothing: none;   /* keep type crisp / pixel-ish */
   }
   .pixel { font-family: 'Press Start 2P', 'VT323', ui-monospace, monospace; }
@@ -50,28 +56,49 @@
     background: radial-gradient(120% 120% at 50% 40%, transparent 60%, rgba(75,72,94,.08) 100%);
   }
 
-  /* ---- panel ---- */
+  /* ---- the set: a panel that switches on ---- */
   #frame {
     position: relative; z-index: 10; margin: auto;   /* centres, never clips */
-    width: min(560px, 100%);
+    width: min(620px, 100%);
     background: var(--card);
     border: 3px solid var(--ink);
     box-shadow: 8px 8px 0 var(--accent-s), 0 0 0 1px var(--card) inset;
+    overflow: hidden;
+    animation: power .5s cubic-bezier(.2,.9,.3,1) both;
   }
+  @keyframes power {
+    0%   { transform: scaleY(.01); filter: brightness(2.4) saturate(.2); }
+    45%  { transform: scaleY(.01); filter: brightness(2.4) saturate(.2); }
+    75%  { transform: scaleY(1.03); filter: brightness(1.35) saturate(.8); }
+    100% { transform: scaleY(1); filter: none; }
+  }
+  #frame::after {                      /* one scanline, drifting down the tube */
+    content: ""; position: absolute; left: 0; right: 0; top: 0; height: 44px;
+    z-index: 30; pointer-events: none;
+    background: linear-gradient(180deg, transparent, rgba(138,127,199,.13), transparent);
+    animation: sweep 7s linear infinite;
+  }
+  @keyframes sweep { from { transform: translateY(-44px); } to { transform: translateY(1200px); } }
+
   #titlebar {
-    display: flex; align-items: center; justify-content: space-between;
+    display: flex; align-items: center; justify-content: space-between; gap: 12px;
     padding: 10px 12px;
     border-bottom: 3px solid var(--ink);
     background: repeating-linear-gradient(90deg, var(--card) 0 8px, #f4f2fb 8px 16px);
   }
   .brand { font-size: 12px; color: var(--ink); text-decoration: none; }
+  .brand:hover { color: var(--accent); }
+  .chip {
+    font-family: 'Press Start 2P', monospace; font-size: 8px; letter-spacing: 1px;
+    color: var(--ink-dim); border: 2px solid var(--accent-s); padding: 4px 6px;
+  }
   .dots { display: flex; gap: 6px; }
   .dots i { width: 11px; height: 11px; display: block; border: 2px solid var(--ink); }
   .dots i.s { background: var(--sage);   }
   .dots i.a { background: var(--accent); }
   .dots i.r { background: var(--rose);   }
 
-  #screen { padding: 22px 22px 24px; min-height: 250px; }
+  #screen { padding: 22px 22px 24px; min-height: 250px; position: relative; z-index: 20; }
 
   #boot { white-space: pre-wrap; color: var(--ink-dim); min-height: 96px; font-size: 20px; }
   #boot b { color: var(--accent); }
@@ -79,51 +106,62 @@
   #console { opacity: 0; transition: opacity .25s steps(4); }
   #console.on { opacity: 1; }
 
-  h1.pixel { font-size: 19px; margin: 2px 0 7px; color: var(--ink); letter-spacing: 1px; }
-  .sub { margin: 0 0 20px; }
-  .sub .tag { color: var(--accent); text-transform: uppercase; letter-spacing: 1px; }
+  /* ---- type ---- */
+  h1.pixel { font-size: 19px; margin: 0 0 7px; color: var(--ink); letter-spacing: 1px;
+             line-height: 1.3; }
+  .sub { margin: 0; }
+  .sub .tag { color: var(--tone); text-transform: uppercase; letter-spacing: 1px; }
+  .muted { color: var(--ink-dim); font-size: 16px; }
+  .cursor { display: inline-block; width: 9px; height: 17px; background: var(--ink);
+            vertical-align: -3px; margin-left: 2px; animation: blink .9s steps(1) infinite; }
+  @keyframes blink { 50% { opacity: .35; } }
 
-  .row { display: flex; align-items: baseline; gap: 12px; margin: 9px 0; flex-wrap: wrap; }
-  .lbl { color: var(--accent); font-size: 11px; min-width: 92px; }
+  /* a dotted rule with a label sitting on it */
+  .rule {
+    display: flex; align-items: center; gap: 10px; margin: 20px 0 14px;
+    font-family: 'Press Start 2P', monospace; font-size: 9px; letter-spacing: 1px;
+    color: var(--accent);
+  }
+  .rule .fill { flex: 1; height: 0; border-top: 2px dotted var(--accent-s); }
+  .rule .count { color: var(--ink-dim); }
 
+  /* ---- the mark a challenge is stamped with ---- */
+  .sigil {
+    display: grid; grid-template-columns: repeat(5, 1fr); gap: 2px;
+    width: 46px; height: 46px; padding: 5px; flex: none;
+    border: 3px solid var(--ink); background: var(--card);
+    box-shadow: 3px 3px 0 var(--tone-s);
+  }
+  .sigil i { display: block; background: transparent; }
+  .sigil i.on { background: var(--tone); }
+  .sigil.lg { width: 62px; height: 62px; padding: 6px; gap: 3px; }
+
+  /* per type, a colour of its own -- anything unlisted keeps the primary */
+  [data-type="pwn"]      { --tone: var(--rose);   --tone-s: var(--rose-s); }
+  [data-type="web"]      { --tone: var(--sage);   --tone-s: var(--sage-s); }
+  [data-type="crypto"]   { --tone: var(--amber);  --tone-s: var(--amber-s); }
+  [data-type="rev"],
+  [data-type="reverse"]  { --tone: var(--accent); --tone-s: var(--accent-s); }
+
+  /* ---- status lamp ---- */
   .led { width: 13px; height: 13px; display: inline-block; border: 2px solid var(--ink);
          background: var(--rose); flex: none; }
   .led.on { background: var(--sage); animation: blink 1.2s steps(1) infinite; }
-  @keyframes blink { 50% { opacity: .35; } }
+  .led.busy { background: var(--amber); animation: blink .4s steps(1) infinite; }
 
-  #state { font-size: 11px; color: var(--rose); }
-  #state.online { color: var(--sage); }
-
-  .copy { color: var(--ink); text-decoration: none; word-break: break-all;
-          border-bottom: 2px dotted var(--accent); cursor: pointer; padding: 0 2px; }
-  .copy:hover { background: var(--accent-s); }
-  .prompt { color: var(--accent); }
-  .cursor { display: inline-block; width: 9px; height: 17px; background: var(--ink);
-            vertical-align: -3px; margin-left: 2px; animation: blink .9s steps(1) infinite; }
-
-  .clock { font-size: 30px; letter-spacing: 2px; color: var(--ink); }
-  .clock.warn { color: var(--amber); }
-  .clock.crit { color: var(--rose); animation: blink .7s steps(1) infinite; }
-
-  .muted { color: var(--ink-dim); font-size: 16px; }
-
-  /* ---- the challenge list ---- */
-  .list { display: flex; flex-direction: column; gap: 0; margin: 4px 0 0;
-          border-top: 2px dotted var(--accent-s); }
-  .chal {
-    display: flex; align-items: center; gap: 12px; padding: 11px 4px;
-    border-bottom: 2px dotted var(--accent-s); text-decoration: none; color: var(--ink);
+  /* ---- a chunky drain bar ---- */
+  .bar {
+    height: 18px; border: 3px solid var(--ink); background: var(--card);
+    padding: 3px; display: flex; overflow: hidden;
   }
-  .chal:hover { background: var(--accent-s); }
-  .chal .name { flex: 1; min-width: 0; }
-  .chal .type { font-size: 10px; color: var(--accent); text-transform: uppercase;
-                letter-spacing: 1px; }
-  .chal .when { font-size: 16px; color: var(--ink-dim); min-width: 66px; text-align: right; }
-  .chal .when.on { color: var(--sage); }
-  .empty { color: var(--ink-dim); }
+  .bar > i {
+    display: block; height: 100%; width: 0;
+    background: repeating-linear-gradient(90deg, var(--tone) 0 8px, transparent 8px 11px);
+  }
+  .bar.warn > i { --tone: var(--amber); }
+  .bar.crit > i { --tone: var(--rose); }
 
   /* ---- buttons: pale pixel blocks ---- */
-  #actions { margin-top: 24px; display: flex; gap: 14px; }
   .btn {
     display: inline-flex; align-items: center; gap: 10px;
     font-family: 'Press Start 2P', monospace; font-size: 11px;
@@ -132,18 +170,29 @@
     cursor: pointer; text-transform: uppercase; letter-spacing: 1px;
     box-shadow: 4px 4px 0 var(--accent-s);
   }
-  .btn .ico { width: 11px; height: 11px; display: inline-block; border: 2px solid var(--ink); background: var(--accent); }
+  .btn .ico { width: 11px; height: 11px; display: inline-block; border: 2px solid var(--ink);
+              background: var(--accent); }
   .btn:hover { background: var(--accent); color: var(--card); box-shadow: 4px 4px 0 var(--ink); }
   .btn:hover .ico { background: var(--card); }
   .btn:active { transform: translate(4px,4px); box-shadow: 0 0 0; }
   .btn:disabled { opacity: .4; cursor: not-allowed; box-shadow: 4px 4px 0 #e6e4ee; }
+  .btn:disabled:hover { background: var(--card); color: var(--ink); }
   .btn.danger { border-color: var(--rose); color: var(--rose); box-shadow: 4px 4px 0 var(--rose-s); }
   .btn.danger .ico { border-color: var(--rose); background: var(--rose); }
   .btn.danger:hover { background: var(--rose); color: var(--card); box-shadow: 4px 4px 0 var(--ink); }
   .btn.danger:hover .ico { background: var(--card); }
 
-  .back { display: inline-block; margin-top: 22px; font-size: 11px; color: var(--accent);
-          text-decoration: none; }
+  /* the keys that do the same thing, for people who never touch the mouse */
+  .keys { margin-top: 16px; display: flex; gap: 16px; flex-wrap: wrap;
+          font-size: 15px; color: var(--ink-dim); }
+  .keys kbd {
+    font-family: 'Press Start 2P', monospace; font-size: 8px; color: var(--ink);
+    border: 2px solid var(--ink-dim); padding: 3px 5px; margin-right: 6px;
+    background: var(--card);
+  }
+
+  .back { display: inline-block; margin-top: 22px; font-family: 'Press Start 2P', monospace;
+          font-size: 9px; color: var(--accent); text-decoration: none; letter-spacing: 1px; }
   .back:hover { text-decoration: underline; }
 
   #error { color: var(--rose); font-size: 16px; margin-top: 14px; min-height: 20px; }
@@ -160,14 +209,19 @@
   @keyframes gr { 0%,93%,100%{clip-path:inset(100% 0 0 0)} 96%{clip-path:inset(60% 0 20% 0)} }
 
   @media (prefers-reduced-motion: reduce) {
-    .led.on, .glitch::before, .glitch::after, .clock.crit { animation: none; }
+    #frame { animation: none; }
+    #frame::after, .led.on, .led.busy, .cursor,
+    .glitch::before, .glitch::after { animation: none; }
   }
+
+{% block style %}{% endblock %}
 </style>
 </head>
 <body>
 <div id="frame">
   <div id="titlebar">
     <a class="brand pixel glitch" href="/" data-text="{{ instancer_name|upper }}">{{ instancer_name|upper }}</a>
+    <span class="chip">{% block chip %}SPAWN SYSTEMS{% endblock %}</span>
     <span class="dots"><i class="s"></i><i class="a"></i><i class="r"></i></span>
   </div>
 

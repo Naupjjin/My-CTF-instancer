@@ -158,10 +158,7 @@ def remove_leftovers(client):
             container.remove(force=True)
     for network in client.networks.list():
         if network.name == CONTROL_NET:
-            network.reload()
-            for endpoint in (network.attrs.get("Containers") or {}):
-                network.disconnect(endpoint, force=True)
-            network.remove()
+            scrub(network)
 
 
 def remove_instances(client):
@@ -171,10 +168,28 @@ def remove_instances(client):
     for network in client.networks.list():
         if not network.name.startswith(NET_PREFIX):
             continue
+        scrub(network)
+
+
+def scrub(network):
+    """Empty a network and take it away.
+
+    Every step of it is best effort, because the instancer is cleaning up at the
+    same time we are: the containers were force-removed a moment ago and an
+    inspect taken before that still lists them, and the network itself may
+    already have been pruned by the reaper. Losing a race to the thing under
+    test is not a test failure.
+    """
+    try:
         network.reload()
         for endpoint in (network.attrs.get("Containers") or {}):
-            network.disconnect(endpoint, force=True)
+            try:
+                network.disconnect(endpoint, force=True)
+            except docker.errors.APIError:
+                pass
         network.remove()
+    except docker.errors.APIError:
+        pass
 
 
 # --- looking at what is there -------------------------------------------------

@@ -55,9 +55,26 @@ services:
       CTFD_SCOPE: ${CTFD_SCOPE:-user}
       # On unless this says "n": before an instance is created the player runs
       # one command and pastes the answer. Ten seconds for a person, ten seconds
-      # every time for a script. Difficulty is iterations -- raise it and the
-      # wait goes up with it.
+      # every time for a script.
       POW_VERIFY: ${POW_VERIFY:-y}
+      # Iterations of work. A whole number, 1000 to 60000 -- roughly
+      # difficulty/1900 seconds with the solver at pwn.red, ten times that for
+      # someone solving it in plain Python:
+      #
+      #     2000    1s     practice box
+      #     10000   5s     an ordinary event
+      #     19000   10s    the default
+      #     60000   32s    punitive; only worth it while being abused
+      #
+      # Above 60000 the checking starts to cost us too: it is linear, and at
+      # 300000 one player pasting nonsense is 0.4s of this container's CPU.
+      #
+      # Two values to stay away from. 0 is not "off" -- it makes every answer
+      # correct, quietly, while the log still says the work is on; use
+      # POW_VERIFY=n instead. A negative number is not "off" either: it fails
+      # while handing out the challenge, so START answers 500 for everybody.
+      # (A value that is not a number at all is the safe mistake -- the
+      # instancer refuses to start, and you find out immediately.)
       POW_DIFFICULTY: ${POW_DIFFICULTY:-19000}
       # Challenge and proxy images are built once, only if missing, so startup is
       # instant on every boot after the first. Set this after editing a challenge

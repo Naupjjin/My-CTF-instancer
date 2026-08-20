@@ -76,6 +76,10 @@ services:
       # (A value that is not a number at all is the safe mistake -- the
       # instancer refuses to start, and you find out immediately.)
       POW_DIFFICULTY: ${POW_DIFFICULTY:-19000}
+      # The way in to /admin, which shows every instance in the event and can
+      # destroy any of them. Empty means there is no admin page at all, which is
+      # the right default: there is no sensible one for a password.
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-}
       # Challenge and proxy images are built once, only if missing, so startup is
       # instant on every boot after the first. Set this after editing a challenge
       # to rebuild them on the next start.

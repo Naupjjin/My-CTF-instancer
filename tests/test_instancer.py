@@ -312,6 +312,7 @@ def daemon(monkeypatch):
     monkeypatch.setattr(instancer.app, "secret_key", "test-secret")
     monkeypatch.setattr(instancer, "POW_VERIFY", False)
     instancer.pow_pending.clear()
+    monkeypatch.setattr(instancer, "ADMIN_TOKEN", "")
     # What startup() leaves behind, and what every create assumes: each
     # challenge already has the proxy that is its only door.
     for challenge in instancer.CHALLENGES.values():
@@ -365,6 +366,18 @@ def ctfd(monkeypatch):
     monkeypatch.setattr(instancer, "CTFD_SCOPE", "user")
     monkeypatch.setattr(urllib.request, "urlopen", fake.urlopen)
     return fake
+
+
+ADMIN = "let-me-in"
+
+
+@pytest.fixture
+def admin(daemon, monkeypatch):
+    """A browser that has signed in to /admin."""
+    monkeypatch.setattr(instancer, "ADMIN_TOKEN", ADMIN)
+    client = instancer.app.test_client()
+    assert client.post("/api/admin/login", json={"token": ADMIN}).status_code == 200
+    return client
 
 
 @pytest.fixture
@@ -887,6 +900,114 @@ def test_it_is_kctfs_format():
     parts = [2184, 43318410807270238229934003759856073607]
     assert sloth.decode_challenge(challenge) == parts
     assert sloth.encode_challenge(parts) == challenge
+
+
+# --- the admin monitor --------------------------------------------------------
+
+def test_without_a_token_there_is_no_admin_page(web, daemon):
+    body = web.get("/admin").get_data(as_text=True)
+    assert "no ADMIN_TOKEN is set" in body
+    assert web.post("/api/admin/login", json={"token": ""}).status_code == 404
+
+
+def test_the_monitor_is_not_reachable_without_signing_in(web, daemon, monkeypatch):
+    monkeypatch.setattr(instancer, "ADMIN_TOKEN", ADMIN)
+    assert web.get("/api/admin").status_code == 404
+    assert web.post("/api/admin/kill", json={"chal": WEB, "owner": "x"}).status_code == 404
+    assert "SIGN IN" in web.get("/admin").get_data(as_text=True)
+
+
+def test_the_wrong_token_gets_nowhere(web, daemon, monkeypatch):
+    monkeypatch.setattr(instancer, "ADMIN_TOKEN", ADMIN)
+    response = web.post("/api/admin/login", json={"token": "guess"})
+    assert response.status_code == 403
+    assert response.get_json()["error"] == instancer.ERROR_ADMIN
+    assert web.get("/api/admin").status_code == 404
+
+
+def test_signing_in_and_out(admin, daemon):
+    assert admin.get("/api/admin").status_code == 200
+    admin.post("/api/admin/logout")
+    assert admin.get("/api/admin").status_code == 404
+
+
+def test_the_monitor_counts_what_is_out(admin, web, other, pwn, chal, daemon):
+    create(web, chal.id)
+    create(other, pwn.id)
+    state = admin.get("/api/admin").get_json()
+    assert state["totals"]["instances"] == 2
+    assert state["totals"]["challenges"] == 2
+    assert {c["chal"]: c["out"] for c in state["challenges"]} == {chal.id: 1, pwn.id: 1}
+    assert {i["chal"] for i in state["instances"]} == {chal.id, pwn.id}
+
+
+def test_the_monitor_never_shows_a_key(admin, web, chal, daemon):
+    key = create(web, chal.id).get_json()["key"]
+    assert key not in admin.get("/api/admin").get_data(as_text=True)
+
+
+def test_an_instance_carries_the_name_ctfd_gave_it(ctfd, admin, web, chal, daemon):
+    verify(web)
+    create(web, chal.id)
+    instance, = admin.get("/api/admin").get_json()["instances"]
+    assert instance["who"] == "player-one"
+    assert instance["owner"] == instancer.ctfd_owner("user", 7)
+
+
+def test_without_ctfd_there_is_only_an_owner_id(admin, web, chal, daemon):
+    create(web, chal.id)
+    instance, = admin.get("/api/admin").get_json()["instances"]
+    assert instance["who"] is None
+
+
+def test_the_monitor_can_take_an_instance_away(admin, web, chal, daemon):
+    create(web, chal.id)
+    owner = admin.get("/api/admin").get_json()["instances"][0]["owner"]
+    assert admin.post("/api/admin/kill",
+                      json={"chal": chal.id, "owner": owner}).get_json()["killed"] is True
+    assert instances(daemon) == []
+    assert status(web, chal.id).get_json() == idle(chal)
+
+
+def test_killing_what_is_not_there_is_not_an_error(admin, chal, daemon):
+    assert admin.post("/api/admin/kill",
+                      json={"chal": chal.id, "owner": "nobody"}).get_json()["killed"] is False
+
+
+def test_a_kill_with_nothing_to_kill_is_refused(admin, daemon):
+    assert admin.post("/api/admin/kill", json={}).status_code == 400
+    assert admin.post("/api/admin/kill", json={"chal": 7, "owner": []}).status_code == 400
+
+
+def test_health_says_what_is_quietly_wrong(admin, daemon, monkeypatch):
+    monkeypatch.setattr(instancer, "PROXY_TOKEN", "")
+    monkeypatch.setattr(instancer, "POW_VERIFY", True)
+    monkeypatch.setattr(instancer, "POW_DIFFICULTY", 0)
+    monkeypatch.setattr(instancer, "SECRET_KEY", None)
+    said = " ".join(note["text"] for note in admin.get("/api/admin").get_json()["health"])
+    assert "PROXY_TOKEN" in said
+    assert "POW_DIFFICULTY" in said
+    assert "SECRET_KEY" in said
+
+
+def test_health_is_quiet_when_all_is_well(admin, daemon, monkeypatch):
+    monkeypatch.setattr(instancer, "SECRET_KEY", "set")
+    assert admin.get("/api/admin").get_json()["health"] == []
+
+
+def test_health_notices_a_proxy_that_is_gone(admin, chal, daemon, monkeypatch):
+    monkeypatch.setattr(instancer, "SECRET_KEY", "set")
+    daemon.containers.pop(instancer.proxy_name(chal.id))
+    said = " ".join(note["text"] for note in admin.get("/api/admin").get_json()["health"])
+    assert "has no proxy running" in said
+
+
+def test_health_notices_a_challenge_that_is_full(admin, web, daemon, monkeypatch):
+    monkeypatch.setattr(instancer, "SECRET_KEY", "set")
+    full = add_challenge(monkeypatch, make_challenge("full-house", port=1400, cap=1))
+    create(web, full.id)
+    said = " ".join(note["text"] for note in admin.get("/api/admin").get_json()["health"])
+    assert "full-house is full (1 of 1)" in said
 
 
 # --- challenges (each challenge's own config.yml) -----------------------------

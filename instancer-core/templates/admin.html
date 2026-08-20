@@ -1,0 +1,242 @@
+{% extends "base.html" %}
+{% block title %}CONTROL // {{ instancer_name }}{% endblock %}
+{% block chip %}CONTROL{% endblock %}
+
+{% block style %}
+  /* ---- the wider frame: a monitor is a table, and tables need room ---- */
+  #frame { width: min(900px, 100%); }
+
+  .gate { border: 3px dashed var(--accent-s); padding: 12px 14px; }
+  .gate .row { display: flex; gap: 12px; margin-top: 10px; }
+  .gate .note { color: var(--ink-dim); font-size: 15px; margin: 0; }
+  .gate input {
+    flex: 1; min-width: 0; padding: 8px 10px;
+    font-family: 'VT323', ui-monospace, monospace; font-size: 20px;
+    color: var(--ink); background: var(--card); border: 3px solid var(--ink);
+  }
+  .gate input:focus { outline: none; border-color: var(--accent); }
+
+  /* ---- the count across the top ---- */
+  .totals { display: flex; gap: 12px; flex-wrap: wrap; }
+  .totals div {
+    flex: 1; min-width: 120px; border: 3px solid var(--ink); background: var(--card);
+    padding: 10px 12px; box-shadow: 4px 4px 0 var(--accent-s);
+  }
+  .totals b { display: block; font-family: 'Press Start 2P', monospace;
+              font-size: 20px; line-height: 1.4; }
+  .totals span { font-family: 'Press Start 2P', monospace; font-size: 8px;
+                 letter-spacing: 1px; color: var(--ink-dim); }
+
+  /* ---- what is wrong ---- */
+  .notes { display: flex; flex-direction: column; gap: 8px; }
+  .note {
+    border-left: 8px solid var(--amber); background: var(--card);
+    border-top: 3px solid var(--ink); border-right: 3px solid var(--ink);
+    border-bottom: 3px solid var(--ink); padding: 8px 12px; font-size: 17px;
+  }
+  .note.error { border-left-color: var(--rose); color: var(--rose); }
+  .note.ok { border-left-color: var(--sage); color: var(--ink-dim); }
+
+  /* ---- the two tables ---- */
+  .scroll { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: 17px; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 2px dotted var(--accent-s);
+           white-space: nowrap; }
+  th { font-family: 'Press Start 2P', monospace; font-size: 8px; letter-spacing: 1px;
+       color: var(--ink-dim); border-bottom: 3px solid var(--ink); }
+  td.dim { color: var(--ink-dim); }
+  td.name { color: var(--accent); }
+  tr:hover td { background: #f6f4fc; }
+  .pill { font-family: 'Press Start 2P', monospace; font-size: 8px; padding: 3px 5px;
+          border: 2px solid var(--sage); color: var(--sage); }
+  .pill.bad { border-color: var(--rose); color: var(--rose); }
+  .kill {
+    font-family: 'Press Start 2P', monospace; font-size: 8px; cursor: pointer;
+    color: var(--rose); background: var(--card); border: 2px solid var(--rose);
+    padding: 4px 6px;
+  }
+  .kill:hover { background: var(--rose); color: var(--card); }
+  .empty { color: var(--ink-dim); padding: 14px 0; }
+  .foot { display: flex; justify-content: space-between; align-items: center;
+          margin-top: 20px; gap: 12px; }
+{% endblock %}
+
+{% block screen %}
+    <div id="console" class="on">
+      <h1 class="pixel">{{ instancer_name|upper }} CONTROL</h1>
+
+      {% if not enabled %}
+      <p class="sub muted">no ADMIN_TOKEN is set, so there is no admin page. Put one
+      in the environment and restart to turn this on.</p>
+
+      {% elif not admin %}
+      <div class="rule">SIGN IN<span class="fill"></span></div>
+      <div class="gate">
+        <p class="note">this page shows every instance in the event.</p>
+        <div class="row">
+          <input id="token" type="password" placeholder="admin token" autocomplete="off"
+                 spellcheck="false" aria-label="admin token">
+          <button id="in" class="btn"><i class="ico"></i>ENTER</button>
+        </div>
+      </div>
+      <div id="error"></div>
+
+      {% else %}
+      <div class="rule">NOW<span class="fill"></span><span class="count" id="clock">--</span></div>
+      <div class="totals">
+        <div><b id="t-out">--</b><span>INSTANCES OUT</span></div>
+        <div><b id="t-cap">--</b><span>CAPACITY</span></div>
+        <div><b id="t-chal">--</b><span>CHALLENGES</span></div>
+        <div><b id="t-pow">--</b><span>PENDING POW</span></div>
+      </div>
+
+      <div class="rule">HEALTH<span class="fill"></span></div>
+      <div class="notes" id="health"></div>
+
+      <div class="rule">CHALLENGES<span class="fill"></span></div>
+      <div class="scroll">
+        <table>
+          <thead><tr><th>CHALLENGE</th><th>MODE</th><th>PROXY</th><th>OUT</th><th>TTL</th></tr></thead>
+          <tbody id="chals"></tbody>
+        </table>
+      </div>
+
+      <div class="rule">INSTANCES<span class="fill"></span><span class="count" id="tally">--</span></div>
+      <div class="scroll">
+        <table>
+          <thead><tr><th>CHALLENGE</th><th>OWNER</th><th>ADDRESS</th><th>LEFT</th><th></th></tr></thead>
+          <tbody id="rows"></tbody>
+        </table>
+      </div>
+      <p class="empty" id="none" hidden>nothing is running.</p>
+
+      <div class="foot">
+        <span class="muted" id="error"></span>
+        <button id="out" class="btn"><i class="ico"></i>SIGN OUT</button>
+      </div>
+      {% endif %}
+
+      <a class="back" href="/">&lt; BACK TO THE RACK</a>
+    </div>
+{% endblock %}
+
+{% block script %}
+<script>
+const ADMIN = {{ admin|tojson }};
+const error = document.getElementById("error");
+
+/* ---------- signing in ---------- */
+if (!ADMIN && {{ enabled|tojson }}) {
+  const token = document.getElementById("token");
+  const enter = document.getElementById("in");
+  const login = async () => {
+    error.textContent = "";
+    try {
+      const r = await fetch("/api/admin/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token: token.value }),
+      });
+      const data = await r.json();
+      if (data.admin) location.reload();
+      else error.textContent = data.error || "refused";
+    } catch (e) { error.textContent = String(e); }
+    token.value = "";
+  };
+  enter.onclick = login;
+  token.addEventListener("keydown", (e) => { if (e.key === "Enter") login(); });
+}
+
+/* ---------- the monitor ---------- */
+function fmt(sec) {
+  if (typeof sec !== "number") return "--:--";
+  const m = Math.floor(sec / 60), s = sec % 60;
+  return String(m).padStart(2, "0") + ":" + String(s).padStart(2, "0");
+}
+function cell(row, text, cls) {
+  const td = document.createElement("td");
+  td.textContent = text;
+  if (cls) td.className = cls;
+  row.appendChild(td);
+  return td;
+}
+function paint(data) {
+  document.getElementById("t-out").textContent = data.totals.instances;
+  document.getElementById("t-cap").textContent = data.totals.capacity;
+  document.getElementById("t-chal").textContent = data.totals.challenges;
+  document.getElementById("t-pow").textContent = data.totals.pending_pow;
+  document.getElementById("clock").textContent =
+    new Date(data.now * 1000).toTimeString().slice(0, 8);
+
+  const health = document.getElementById("health");
+  health.replaceChildren();
+  const notes = data.health.length ? data.health
+    : [{ level: "ok", text: "nothing to report." }];
+  for (const item of notes) {
+    const line = document.createElement("div");
+    line.className = "note " + item.level;
+    line.textContent = item.text;
+    health.appendChild(line);
+  }
+
+  const chals = document.getElementById("chals");
+  chals.replaceChildren();
+  for (const c of data.challenges) {
+    const row = document.createElement("tr");
+    cell(row, c.chal);
+    cell(row, (c.mode === "netcat" ? "nc" : "http") + " :" + c.proxy_port, "dim");
+    const proxy = cell(row, "");
+    const pill = document.createElement("span");
+    pill.className = "pill" + (c.proxy === "running" ? "" : " bad");
+    pill.textContent = c.proxy.toUpperCase();
+    proxy.appendChild(pill);
+    cell(row, c.out + " / " + c.capacity, c.out >= c.capacity ? "name" : "");
+    cell(row, c.ttl + "s", "dim");
+    chals.appendChild(row);
+  }
+
+  const rows = document.getElementById("rows");
+  rows.replaceChildren();
+  for (const i of data.instances) {
+    const row = document.createElement("tr");
+    cell(row, i.chal);
+    cell(row, i.who || i.owner, i.who ? "name" : "dim");
+    cell(row, (i.address || "?") + ":" + (i.port || "?"), "dim");
+    cell(row, i.status === "running" ? fmt(i.remaining) : i.status,
+         i.status === "running" ? "" : "dim");
+    const last = cell(row, "");
+    const kill = document.createElement("button");
+    kill.className = "kill";
+    kill.textContent = "KILL";
+    kill.onclick = () => {
+      if (!confirm("Destroy " + i.chal + " of " + (i.who || i.owner) + "?")) return;
+      fetch("/api/admin/kill", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chal: i.chal, owner: i.owner }),
+      }).then(refresh);
+    };
+    last.appendChild(kill);
+    rows.appendChild(row);
+  }
+  document.getElementById("none").hidden = data.instances.length > 0;
+  document.getElementById("tally").textContent =
+    data.instances.length ? data.instances.length + " OUT" : "NONE RUNNING";
+}
+async function refresh() {
+  try {
+    const r = await fetch("/api/admin");
+    if (r.status === 404) { location.reload(); return; }   // signed out elsewhere
+    paint(await r.json());
+    error.textContent = "";
+  } catch (e) { error.textContent = String(e); }
+}
+
+if (ADMIN) {
+  document.getElementById("out").onclick = () =>
+    fetch("/api/admin/logout", { method: "POST" }).then(() => location.reload());
+  refresh();
+  setInterval(refresh, 5000);
+}
+</script>
+{% endblock %}

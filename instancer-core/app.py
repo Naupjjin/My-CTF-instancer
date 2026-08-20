@@ -113,6 +113,11 @@ CTFD_SCOPES = ("user", "team")
 # a pasted password costs CTFd nothing.
 CTFD_TOKEN = re.compile(r"\Actfd_[0-9a-f]{64}\Z")
 
+# The way in to /admin. Unset means there is no admin page at all -- a
+# monitor that shows every instance in the event is not something to leave
+# open, and there is no sensible default for a password.
+ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
+
 # The work a player does before an instance is created: one command, ten seconds
 # or so, paid again on every START. On unless POW_VERIFY says otherwise -- it is
 # what stops a script from taking the whole pool while people are still reading.
@@ -166,6 +171,7 @@ LABEL_SUBNET = "ctf.subnet"
 LABEL_PORT = "ctf.port"
 LABEL_KEY = "ctf.key"
 LABEL_SPEC = "ctf.proxy_spec"
+LABEL_NAME = "ctf.name"       # who the owner is, when CTFd said; for /admin only
 
 # What a player is told when something breaks. Docker's own messages name
 # images, ports, subnets and container ids -- all of it ours to read in the log,
@@ -180,6 +186,7 @@ ERROR_BAD_TOKEN = "CTFd does not know that token"
 ERROR_CTFD = "could not check your token with CTFd, try again in a moment"
 ERROR_NO_TEAM = "join a team in CTFd first"
 ERROR_POW = "that proof of work did not check out -- here is a new one"
+ERROR_ADMIN = "that is not the admin token"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("instancer")
@@ -845,7 +852,7 @@ def remove_instance(chal, owner):
     return removed
 
 
-def create_container(chal, owner, port, subnet, key, expires_at):
+def create_container(chal, owner, port, subnet, key, expires_at, who=None):
     limits = {}
     if chal.mem_limit:
         limits["mem_limit"] = chal.mem_limit
@@ -864,6 +871,7 @@ def create_container(chal, owner, port, subnet, key, expires_at):
             LABEL_SUBNET: str(subnet),
             LABEL_PORT: str(port),
             LABEL_KEY: key,
+            **({LABEL_NAME: who} if who else {}),
         },
         **limits,
     )
@@ -1087,6 +1095,104 @@ def no_such_challenge():
     return jsonify(running=False, error=ERROR_NO_CHAL), 404
 
 
+# --- what the organiser sees --------------------------------------------------
+
+def is_admin():
+    return bool(ADMIN_TOKEN) and session.get("admin") is True
+
+
+def health():
+    """Everything about this deployment that is wrong, or about to be.
+
+    The settings that fail quietly are the ones worth a panel: an instancer with
+    no PROXY_TOKEN serves pages all day and lets nobody through a door, and a
+    proof of work at difficulty 0 says it is on in the log while passing every
+    answer.
+    """
+    notes = []
+
+    def note(level, text):
+        notes.append({"level": level, "text": text})
+
+    if not CHALLENGES:
+        note("error", "no challenge is being served")
+    if not PROXY_TOKEN:
+        note("error", "PROXY_TOKEN is unset: every key lookup is refused, so no "
+                      "player gets through any proxy")
+    elif PROXY_TOKEN == "dev-proxy-token":
+        note("warn", "PROXY_TOKEN is still the shipped placeholder")
+    if not SECRET_KEY:
+        note("warn", "SECRET_KEY is unset: a restart drops every session, and "
+                     "with it who owns what")
+    if CTFD_VERIFY and not CTFD_URL:
+        note("error", "CTFD_VERIFY is on but CTFD_URL is unset: no token can be "
+                      "checked, so nothing can start")
+    if CTFD_VERIFY and CTFD_SCOPE not in CTFD_SCOPES:
+        note("warn", "CTFD_SCOPE is %r, which is not a scope; treated as user"
+             % CTFD_SCOPE)
+    if POW_VERIFY and POW_DIFFICULTY < 1:
+        note("error", "POW_DIFFICULTY is %d: every answer passes. Use POW_VERIFY=n "
+                      "to turn the work off" % POW_DIFFICULTY)
+    return notes
+
+
+def admin_state():
+    """One pass over the daemon: what is up, what is out, and what is wrong."""
+    containers = client().containers.list(all=True)
+    running = [c for c in containers if c.name.startswith(CONTAINER_PREFIX)]
+    proxies = {label(c, LABEL_CHAL) or c.name[len(PROXY_PREFIX):]: c.status
+               for c in containers if c.name.startswith(PROXY_PREFIX)}
+    now = int(time.time())
+
+    instances = []
+    for container in sorted(running, key=lambda c: c.name):
+        expires_at = instance_expires_at(container)
+        instances.append({
+            "chal": instance_chal(container),
+            "owner": instance_owner(container),
+            "who": label(container, LABEL_NAME),
+            "status": container.status,
+            "address": instance_address(container),
+            "port": instance_port(container),
+            "expires_at": expires_at,
+            "remaining": max(0, expires_at - now) if expires_at is not None else None,
+        })
+
+    out = {}
+    for instance in instances:
+        out[instance["chal"]] = out.get(instance["chal"], 0) + 1
+    challenges = [{
+        "chal": c.id, "name": c.name, "type": c.type, "mode": c.mode,
+        "proxy_port": c.proxy_port, "proxy": proxies.get(c.id, "missing"),
+        "out": out.get(c.id, 0), "capacity": c.capacity, "ttl": c.ttl,
+    } for c in CHALLENGES.values()]
+
+    notes = health()
+    for challenge in challenges:
+        if challenge["proxy"] != "running":
+            notes.append({"level": "error", "text": "%s has no proxy running (%s): "
+                          "nobody can reach it" % (challenge["chal"], challenge["proxy"])})
+        elif challenge["out"] >= challenge["capacity"]:
+            notes.append({"level": "warn", "text": "%s is full (%d of %d)"
+                          % (challenge["chal"], challenge["out"], challenge["capacity"])})
+
+    return {
+        "name": INSTANCER_NAME,
+        "now": now,
+        "totals": {"instances": len(instances), "challenges": len(challenges),
+                   "capacity": sum(c["capacity"] for c in challenges),
+                   "pending_pow": len(pow_pending)},
+        "settings": {
+            "ctfd": CTFD_VERIFY and (CTFD_SCOPE if CTFD_SCOPE in CTFD_SCOPES else "user"),
+            "pow": POW_DIFFICULTY if POW_VERIFY else False,
+            "reap_on_shutdown": REAP_ON_SHUTDOWN,
+        },
+        "health": notes,
+        "challenges": challenges,
+        "instances": instances,
+    }
+
+
 # --- routes -------------------------------------------------------------------
 
 @app.context_processor
@@ -1210,7 +1316,8 @@ def create(chal):
             expires_at = int(time.time()) + found.ttl
             create_network(chal, owner, subnet)
             attach_proxy(chal, owner)
-            container = create_container(found, owner, port, subnet, key, expires_at)
+            container = create_container(found, owner, port, subnet, key, expires_at,
+                                         who=session.get("ctfd"))
             container.start()
             container.reload()
         except Exception as exc:
@@ -1252,6 +1359,59 @@ def destroy(chal):
     if removed:
         log.info("instance destroyed for %s/%s", chal, owner)
     return idle_json(found)
+
+
+@app.get("/admin")
+def admin_page():
+    return render_template("admin.html", instancer_name=INSTANCER_NAME,
+                           enabled=bool(ADMIN_TOKEN), admin=is_admin())
+
+
+@app.post("/api/admin/login")
+def admin_login():
+    """The only way in. Nothing else here works without it."""
+    if not ADMIN_TOKEN:
+        return jsonify(admin=False), 404
+    given = (request.get_json(silent=True) or {}).get("token")
+    if not isinstance(given, str) or not secrets.compare_digest(
+            given.encode(), ADMIN_TOKEN.encode()):
+        log.warning("admin login refused from %s", request.remote_addr)
+        return jsonify(admin=False, error=ERROR_ADMIN), 403
+    session["admin"] = True
+    log.info("admin signed in from %s", request.remote_addr)
+    return jsonify(admin=True)
+
+
+@app.post("/api/admin/logout")
+def admin_logout():
+    session.pop("admin", None)
+    return jsonify(admin=False)
+
+
+@app.get("/api/admin")
+def admin_api():
+    if not is_admin():
+        return jsonify(error="not found"), 404
+    return jsonify(admin_state())
+
+
+@app.post("/api/admin/kill")
+def admin_kill():
+    """Take one instance away. The same path a player's STOP takes."""
+    if not is_admin():
+        return jsonify(error="not found"), 404
+    body = request.get_json(silent=True) or {}
+    chal, owner = body.get("chal"), body.get("owner")
+    if not isinstance(chal, str) or not isinstance(owner, str):
+        return jsonify(killed=False), 400
+    with owner_lock(chal, owner):
+        try:
+            killed = remove_instance(chal, owner)
+        except Exception as exc:
+            log.error("admin kill failed for %s/%s: %s", chal, owner, exc)
+            return jsonify(killed=False, error=ERROR_DESTROY), 500
+    log.info("admin killed the instance of %s/%s", chal, owner)
+    return jsonify(killed=killed)
 
 
 @app.get("/internal/route/<chal>/<key>")

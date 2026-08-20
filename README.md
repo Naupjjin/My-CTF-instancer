@@ -229,9 +229,11 @@ Defaults in brackets. The instancer:
 | `POW_VERIFY` | `y` | proof of work before an instance is created; `n` turns it off |
 | `POW_DIFFICULTY` | `19000` | iterations of work — roughly 10s with the solver at pwn.red |
 | `POW_TTL` | `120` | seconds a challenge stays answerable |
+| `ADMIN_TOKEN` | unset | the way in to `/admin`; unset means there is no admin page |
 
-Only nine of these are written in `docker-compose.yml` — the two secrets, the UI
-port, the name, `PROXY_HOST`, the CTFd settings and the proof of work. The rest have defaults
+Only ten of these are written in `docker-compose.yml` — the two secrets, the UI
+port, the name, `PROXY_HOST`, the CTFd settings, the proof of work and the
+admin token. The rest have defaults
 that are already right for the compose layout, and nothing about a *challenge* is
 there at all: there is one environment and many challenges, so a per-challenge
 value has nowhere to live except with the challenge.
@@ -382,6 +384,46 @@ punishing a double-click. And with `CTFD_VERIFY` on the **token is checked
 first** — being sent away to compute for ten seconds and *then* told to log in
 would be a poor trade.
 
+### The monitor — `/admin`
+
+One page for whoever is running the event: what is out, what is wrong, and a way
+to take any instance away.
+
+```sh
+ADMIN_TOKEN=$(openssl rand -hex 16) docker compose up -d
+```
+
+Unset, there is no admin page at all — `/admin` says so and every route under it
+is a `404`. There is no default token because there is no sensible one for a
+password, and this page shows every instance in the event.
+
+It refreshes every five seconds and has four parts:
+
+**NOW** — instances out, total capacity, challenges served, and proof-of-work
+challenges handed out but not yet answered. A rising `PENDING POW` with a flat
+`INSTANCES OUT` is somebody hammering START and not doing the work.
+
+**HEALTH** — the settings that fail *quietly*, which are the only ones worth a
+panel. An instancer with no `PROXY_TOKEN` serves pages all day and lets nobody
+through a door; `POW_DIFFICULTY=0` says the work is on in the log while passing
+every answer; a challenge whose proxy died is unreachable while looking fine on
+the rack. Also `SECRET_KEY` unset, `CTFD_VERIFY` on with no `CTFD_URL`, and any
+challenge that is full. Nothing to say is itself the answer: "nothing to
+report."
+
+**CHALLENGES** — one row each: mode and port, whether its proxy is *running*,
+how many are out against its ceiling, and its `ttl`.
+
+**INSTANCES** — one row each: challenge, owner, address, time left, and a KILL
+button that goes through the same lock a player's STOP does. With `CTFD_VERIFY`
+on the owner column shows the CTFd name rather than the hash — an organiser
+looking at `f934e46d634b8b08` cannot act on it, and `naup96321` they can. That
+name is stamped on the container as a label at create time.
+
+**Keys are never on this page.** A key is the one credential a player has; an
+organiser needs to know *who* holds an instance and *when it dies*, and neither
+of those is the key.
+
 ## Challenge requirements
 
 `challenges/<id>/` must contain a `config.yml` (above) and a `Dockerfile` that
@@ -503,6 +545,11 @@ the log.
 | `GET /api/<chal>/status` | your instance of it, or `{"running": false, ...}` |
 | `POST /api/<chal>/create` | your instance; returns the existing one if you already have it, `403`/`428`/`503`/`500` + `{"running": false, "error": ...}` on failure |
 | `POST /api/<chal>/destroy` | `{"running": false, ...}`, also when you had nothing running |
+| `GET /admin` | the monitor, or a way in to it; a plain page saying so when `ADMIN_TOKEN` is unset |
+| `POST /api/admin/login` | `{"token": ...}` → `{"admin": true}`; `403` otherwise |
+| `POST /api/admin/logout` | drops it again |
+| `GET /api/admin` | everything the monitor shows; `404` unless signed in |
+| `POST /api/admin/kill` | `{"chal": ..., "owner": ...}` → `{"killed": bool}`; `404` unless signed in |
 | `GET /internal/route/<chal>/<key>` | `{"host": ..., "port": ...}` for that challenge's proxy; `404` without its `X-Proxy-Token` |
 
 `POST /api/<chal>/create` takes one parameter and only when `POW_VERIFY` is on:

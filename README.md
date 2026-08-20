@@ -32,7 +32,6 @@ proxy: one container, one port, and a key that says which instance you get.
 
 ```
 challenges/           one directory per challenge: Dockerfile + config.yml
-config.yml            the instancer's own name, and nothing else
 instancer-core/       the instancer: app.py + templates/
 proxy-core/           the proxy: proxy.py (stdlib only) + its Dockerfile
 Dockerfile.instancer  image for the instancer
@@ -118,20 +117,11 @@ challenge's `ttl` anyway — but only while an instancer is running to reap them
 
 ## Configuration
 
-### The instancer — `config.yml`
-
-The one thing that is not an environment variable, because it is written rather
-than configured: what the page calls this deployment.
-
-```yaml
-instancer_name: SpawnZero
-```
-
-It is the titlebar, the boot banner, and the first line the instancer logs on
-startup. Nothing here changes how anything runs — a missing key falls back to a
-default, and a missing or broken file leaves the instancer running with a
-placeholder and a complaint in the log rather than refusing to start. Unknown
-keys are ignored out loud. Point `CONFIG_FILE` elsewhere to use another path.
+There are two places to configure this, and which one a setting belongs in
+follows from how many of the thing there are. A challenge has its own file,
+because there are many challenges. The deployment has environment variables,
+because there is one deployment — and that is the whole of it: the instancer has
+no config file of its own.
 
 ### A challenge — `challenges/<id>/config.yml`
 
@@ -227,16 +217,16 @@ Defaults in brackets. The instancer:
 | `CLEANUP_INTERVAL` | `10` | how often the background reaper checks for expiry (seconds) |
 | `REAP_ON_SHUTDOWN` | `1` | destroy every instance and proxy when the instancer is asked to stop; `0` leaves them for the next start to adopt |
 | `LISTEN_PORT` | `5000` | port of the instancer web UI |
-| `CONFIG_FILE` | `config.yml` | path of the instancer's own config |
+| `INSTANCER_NAME` | `SpawnZero` | what this deployment calls itself: titlebar, boot banner, first line of the log |
 | `SECRET_KEY` | random | signs the session cookies that carry instance ownership |
 | `PROXY_HOST` | unset | default proxy hostname shown to players (unset = the host serving the UI) |
 | `PROXY_TOKEN` | unset | the shared secret every proxy's own token is derived from |
 
 Only five of these are written in `docker-compose.yml` — the two secrets, the UI
-port, the path of the instancer's own config, and `PROXY_HOST`. The rest have
-defaults that are already right for the compose layout, and nothing about a
-*challenge* is there at all: there is one environment and many challenges, so a
-per-challenge value has nowhere to live except with the challenge.
+port, the name, and `PROXY_HOST`. The rest have defaults that are already right
+for the compose layout, and nothing about a *challenge* is there at all: there is
+one environment and many challenges, so a per-challenge value has nowhere to live
+except with the challenge.
 
 And the proxy — all of it handed over by the instancer, which creates the
 container:

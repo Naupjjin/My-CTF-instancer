@@ -10,9 +10,10 @@
 # file never changes for it.
 #
 # Nor is anything about a challenge here: its mode, its port, its lifetime, its
-# subnet pool and its instance port range all live in challenges/<id>/config.yml,
-# because there is one of each per challenge and only one environment. What is
-# left below is this deployment and nothing else.
+# subnet pool, its instance port range and its cap all live in
+# challenges/<id>/config.yml, because there is one of each per challenge and only
+# one environment. What is left below is this deployment and nothing else -- and
+# all of it fits here, which is why the instancer has no config file of its own.
 services:
   instancer:
     build:
@@ -27,7 +28,6 @@ services:
     volumes:
       - ./challenges:/challenges:ro
       - ./proxy-core:/proxy-core:ro
-      - ./config.yml:/config.yml:ro
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
       # Keep this stable (e.g. in a .env file): it signs the session cookies
@@ -38,7 +38,9 @@ services:
       # anything but a local run.
       PROXY_TOKEN: ${PROXY_TOKEN:-dev-proxy-token}
       LISTEN_PORT: ${LISTEN_PORT:-5000}
-      CONFIG_FILE: /config.yml
+      # What this deployment calls itself: the titlebar, the boot banner, and the
+      # first line in the log.
+      INSTANCER_NAME: ${INSTANCER_NAME:-SpawnZero}
       # Set this only when players reach the proxies under a different name than
       # this page (a second host, a DNS name). Empty = same host as the UI. A
       # challenge may override it in its own config.yml.

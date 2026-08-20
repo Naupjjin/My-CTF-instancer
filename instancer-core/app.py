@@ -89,8 +89,10 @@ KEY_BYTES = 16
 # The environment variable that tells a challenge which port to listen on.
 PORT_ENV = os.environ.get("PORT_ENV", "CHAL_PORT")
 
-# The instancer's own name, the one thing that is written rather than configured.
-CONFIG_FILE = os.environ.get("CONFIG_FILE", "config.yml")
+# What this deployment calls itself: the titlebar, the boot banner, and the first
+# line in the log. There is one instancer, so there is one of these -- which is
+# why it is an environment variable and not a file of its own.
+INSTANCER_NAME = os.environ.get("INSTANCER_NAME", "SpawnZero")
 
 # What a challenge gets when its config.yml does not say. Where an instance
 # lives is the challenge's business now -- its own pool and its own port range,
@@ -150,10 +152,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("instancer")
 
 
-# --- names --------------------------------------------------------------------
-
-DEFAULT_CONFIG = {"instancer_name": "SpawnZero"}
-
+# --- reading a challenge ------------------------------------------------------
 
 def read_yaml(path):
     """Load one config file. Returns a mapping, or None if it is not usable.
@@ -176,28 +175,6 @@ def read_yaml(path):
         return None
     return loaded
 
-
-def load_config(path=None):
-    """Read the instancer's own config.yml. Names only -- nothing here changes
-    how anything runs; that is what each challenge's config.yml is for."""
-    path = path or CONFIG_FILE
-    loaded = read_yaml(path)
-    if loaded is None:
-        log.warning("falling back to default names")
-        return dict(DEFAULT_CONFIG)
-    unknown = set(loaded) - set(DEFAULT_CONFIG)
-    if unknown:
-        log.warning("ignoring unknown key(s) in %s: %s", path, ", ".join(sorted(unknown)))
-    config = dict(DEFAULT_CONFIG)
-    config.update({key: str(loaded[key]) for key in DEFAULT_CONFIG
-                   if loaded.get(key) is not None})
-    return config
-
-
-CONFIG = load_config()
-
-
-# --- challenges ---------------------------------------------------------------
 
 class Challenge:
     """One challenge: its directory, its image, its proxy, and what an instance
@@ -979,16 +956,19 @@ def index():
     # Mint the session here, so two fast clicks on Start cannot race each other
     # into two identities (and therefore two containers).
     owner_id()
-    return render_template("index.html", challenges=list(CHALLENGES.values()), **CONFIG)
+    return render_template("index.html", challenges=list(CHALLENGES.values()),
+                           instancer_name=INSTANCER_NAME)
 
 
 @app.get("/c/<chal>")
 def challenge_page(chal):
     found = challenge(chal)
     if found is None:
-        return render_template("missing.html", chal=chal, **CONFIG), 404
+        return render_template("missing.html", chal=chal,
+                               instancer_name=INSTANCER_NAME), 404
     owner_id()
-    return render_template("challenge.html", chal=found, **CONFIG)
+    return render_template("challenge.html", chal=found,
+                           instancer_name=INSTANCER_NAME)
 
 
 @app.get("/api/challenges")
@@ -1251,7 +1231,7 @@ def startup():
         log.info("adopted instance of %s/%s (%s), expires_at=%s",
                  instance_chal(container), instance_owner(container),
                  container.status, instance_expires_at(container))
-    log.info("%s serving %d challenge(s)", CONFIG["instancer_name"], len(CHALLENGES))
+    log.info("%s serving %d challenge(s)", INSTANCER_NAME, len(CHALLENGES))
     for chal in CHALLENGES.values():
         log.info("  %s on :%d (%s), ttl %ds, up to %d at once from %s in /%d",
                  chal.id, chal.proxy_port, chal.mode, chal.ttl, chal.capacity,

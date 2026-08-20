@@ -429,55 +429,17 @@ def test_the_challenge_list_reports_what_you_have_running(web, daemon, pwn, chal
     assert listed[pwn.id]["type"] == "pwn"
 
 
-# --- names (the instancer's own config.yml) -----------------------------------
-
-def write_config(tmp_path, text, name="config.yml"):
-    path = tmp_path / name
-    path.write_text(text)
-    return str(path)
-
-
-def test_config_is_read_from_the_file(tmp_path):
-    path = write_config(tmp_path, "instancer_name: Zero\n")
-    assert instancer.load_config(path) == {"instancer_name": "Zero"}
-
-
-def test_config_fills_in_what_the_file_leaves_out(tmp_path):
-    config = instancer.load_config(write_config(tmp_path, "{}\n"))
-    assert config == instancer.DEFAULT_CONFIG
-
-
-def test_config_values_are_always_strings(tmp_path):
-    # `instancer_name: 1337` is a number to YAML and a name to everyone else.
-    path = write_config(tmp_path, "instancer_name: 1337\n")
-    assert instancer.load_config(path)["instancer_name"] == "1337"
-
-
-def test_a_missing_config_does_not_stop_the_instancer(tmp_path, caplog):
-    assert instancer.load_config(str(tmp_path / "nope.yml")) == instancer.DEFAULT_CONFIG
-    assert "falling back to default names" in caplog.text
-
-
-def test_a_broken_config_does_not_stop_the_instancer(tmp_path, caplog):
-    path = write_config(tmp_path, "instancer_name: [unclosed\n")
-    assert instancer.load_config(path) == instancer.DEFAULT_CONFIG
-    assert "not valid YAML" in caplog.text
-
-
-def test_a_config_that_is_not_a_mapping_does_not_stop_the_instancer(tmp_path, caplog):
-    assert instancer.load_config(write_config(tmp_path, "- pwn\n")) == instancer.DEFAULT_CONFIG
-    assert "not a mapping" in caplog.text
-
-
-def test_unknown_config_keys_are_ignored_out_loud(tmp_path, caplog):
-    path = write_config(tmp_path, "instancer_name: Zero\nflag: AIS3{...}\n")
-    assert "flag" not in instancer.load_config(path)
-    assert "ignoring unknown key(s)" in caplog.text
-
+# --- the instancer's own name -------------------------------------------------
 
 def test_the_page_shows_the_configured_name(web, daemon, monkeypatch):
-    monkeypatch.setattr(instancer, "CONFIG", {"instancer_name": "Zero"})
+    monkeypatch.setattr(instancer, "INSTANCER_NAME", "Zero")
     assert "ZERO" in web.get("/").get_data(as_text=True)
+
+
+def test_the_name_reaches_every_page(web, daemon, chal, monkeypatch):
+    monkeypatch.setattr(instancer, "INSTANCER_NAME", "Zero")
+    for path in ("/", "/c/%s" % chal.id, "/c/nope"):
+        assert "ZERO" in web.get(path).get_data(as_text=True), path
 
 
 # --- challenges (each challenge's own config.yml) -----------------------------
@@ -608,6 +570,24 @@ def test_a_challenge_without_a_config_is_skipped(tmp_path, caplog):
     write_challenge(tmp_path, "silent", config=None)
     assert instancer.load_challenges(str(tmp_path)) == {}
     assert "no usable config.yml" in caplog.text
+
+
+def test_a_challenge_whose_config_is_not_valid_yaml_is_skipped(tmp_path, caplog):
+    write_challenge(tmp_path, "broken", "name: [unclosed\n")
+    assert instancer.load_challenges(str(tmp_path)) == {}
+    assert "not valid YAML" in caplog.text
+
+
+def test_a_challenge_whose_config_is_not_a_mapping_is_skipped(tmp_path, caplog):
+    write_challenge(tmp_path, "listy", "- pwn\n")
+    assert instancer.load_challenges(str(tmp_path)) == {}
+    assert "not a mapping" in caplog.text
+
+
+def test_a_challenge_name_is_always_a_string(tmp_path):
+    # `name: 1337` is a number to YAML and a name to everyone else.
+    write_challenge(tmp_path, "numeric", "proxy_port: 9000\nname: 1337\n")
+    assert instancer.load_challenges(str(tmp_path))["numeric"].name == "1337"
 
 
 def test_a_challenge_without_a_proxy_port_is_skipped(tmp_path, caplog):

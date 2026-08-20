@@ -1,7 +1,8 @@
 # SpawnZero
 
 A CTF instancer. Many challenges, one service, one instance of each per browser
-session. Creating an instance hands out four things nobody else has:
+session — or per CTFd account, if you turn `CTFD_VERIFY` on. Creating an instance
+hands out four things nobody else has:
 
 * a **container**,
 * a **subnet** — its own internal /24, with no gateway,
@@ -221,12 +222,15 @@ Defaults in brackets. The instancer:
 | `SECRET_KEY` | random | signs the session cookies that carry instance ownership |
 | `PROXY_HOST` | unset | default proxy hostname shown to players (unset = the host serving the UI) |
 | `PROXY_TOKEN` | unset | the shared secret every proxy's own token is derived from |
+| `CTFD_VERIFY` | `n` | `y` makes a player a CTFd account instead of a browser session — see below |
+| `CTFD_URL` | unset | the CTFd to ask whose token it is; required when the above is on |
+| `CTFD_TIMEOUT` | `5` | seconds to wait for CTFd to answer |
 
-Only five of these are written in `docker-compose.yml` — the two secrets, the UI
-port, the name, and `PROXY_HOST`. The rest have defaults that are already right
-for the compose layout, and nothing about a *challenge* is there at all: there is
-one environment and many challenges, so a per-challenge value has nowhere to live
-except with the challenge.
+Only seven of these are written in `docker-compose.yml` — the two secrets, the UI
+port, the name, `PROXY_HOST`, and the two CTFd settings. The rest have defaults
+that are already right for the compose layout, and nothing about a *challenge* is
+there at all: there is one environment and many challenges, so a per-challenge
+value has nowhere to live except with the challenge.
 
 And the proxy — all of it handed over by the instancer, which creates the
 container:
@@ -249,6 +253,69 @@ Set it (a `.env` file next to `docker-compose.yml` works) in anything but a
 throwaway run. Do the same for `PROXY_TOKEN`: the shipped default is a
 placeholder, and an unset one makes the instancer refuse *every* key lookup, so
 nobody gets through any proxy at all.
+
+### CTFd — one account, one instance
+
+Off by default: a player is a browser session, and clearing cookies is a new
+player. That is fine for a practice box and not fine for a scored event, so:
+
+```yaml
+    environment:
+      CTFD_VERIFY: "y"
+      CTFD_URL: "https://ctf.example.com"
+```
+
+or, in the `.env` next to `docker-compose.yml`:
+
+```sh
+CTFD_VERIFY=y
+CTFD_URL=https://ctf.example.com
+```
+
+With it on, START asks for a CTFd **API token** first — the one CTFd hands out
+under *Settings → Access Tokens*, `ctfd_` and 64 hex. The instancer spends it on
+the one question CTFd can answer about it:
+
+```
+GET <CTFD_URL>/api/v1/users/me
+Authorization: Token ctfd_…
+```
+
+A `200` is both "this token is real" and "this is whose", because CTFd answers
+that route for the account the token belongs to and for nobody else. The account
+id it comes back with is the player: hashed to sixteen hex, and used everywhere a
+session id was used before, so the container is `ctf-instance-<chal>-<account>`
+and **one token holds one instance of each challenge**. A second browser, a
+cleared cookie or a shared token all land on the same instance and hand it back
+rather than opening another. (One *per challenge*, not one in total — the same
+account still gets one of every challenge at once, each on its own `ttl`.)
+
+The hash is plain SHA-256 of the account id, deliberately with nothing secret and
+nothing per-process in it: an owner id that moved when the instancer restarted
+would hand every player a second instance every time it came back up. It is a
+name, never a credential — the key is still the only credential, and there is a
+fresh one per instance.
+
+The token itself is read once, checked, and dropped; what the session cookie
+carries afterwards is the account, never the token. Verifying a second token in
+the same browser is a second player sitting down, not a second instance: what the
+first one had stays theirs and runs out its `ttl`.
+
+Failures say only what a player can act on. A token of the wrong shape is refused
+without troubling CTFd at all; one CTFd does not know gets `403` + "CTFd does not
+know that token". A CTFd that cannot be reached — or answers something that is
+not CTFd — is *not* a refusal: it gets `503` + "try again in a moment", and the
+reason lands in the log, because an event whose CTFd blinks must not hand every
+player a fresh identity. `CTFD_VERIFY=y` with no `CTFD_URL` fails closed, loudly,
+at startup and on every attempt: with nowhere to ask, nothing starts.
+
+Two things worth knowing before an event. The instancer reaches CTFd over the
+control network, so CTFd has to be reachable *from the instancer container* — a
+CTFd on the same host is `http://<host-ip>:8000`, not `localhost`. And turning
+this on mid-event is safe: a session id minted while it was off is a cookie, not
+an account, and does not become one because the setting changed underneath it —
+those players are asked for a token like everybody else. Instances they already
+had keep running under the old owner id and expire on schedule.
 
 ## Challenge requirements
 
@@ -367,8 +434,9 @@ the log.
 | `GET /` | the challenge list |
 | `GET /c/<chal>` | one challenge's page; `404` for a challenge that is not served |
 | `GET /api/challenges` | every challenge, and whether you have one running |
+| `POST /api/verify` | `{"token": "ctfd_…"}` → `{"ctfd": true, "verified": true, "user": ...}`; `403` for a token CTFd does not know, `503` when CTFd could not be asked. Only meaningful with `CTFD_VERIFY` on |
 | `GET /api/<chal>/status` | your instance of it, or `{"running": false, ...}` |
-| `POST /api/<chal>/create` | your instance; returns the existing one if you already have it, `503`/`500` + `{"running": false, "error": ...}` on failure |
+| `POST /api/<chal>/create` | your instance; returns the existing one if you already have it, `403`/`503`/`500` + `{"running": false, "error": ...}` on failure |
 | `POST /api/<chal>/destroy` | `{"running": false, ...}`, also when you had nothing running |
 | `GET /internal/route/<chal>/<key>` | `{"host": ..., "port": ...}` for that challenge's proxy; `404` without its `X-Proxy-Token` |
 
@@ -386,6 +454,13 @@ container (`ctf-instance-<chal>-<id>`) and the network
 challenge. Somebody else's `/status` reports nothing and their `/destroy` removes
 nothing. Users never send an image, port, subnet, command, or anything else
 Docker acts on.
+
+With `CTFD_VERIFY` on that id is not minted at all: it is the CTFd account behind
+a verified token, so the sentence above holds with "account" in place of
+"browser", and `/create` is `403` + "verify your CTFd token" until `POST
+/api/verify` has said who is asking. The one thing a player *does* send in that
+mode is the token, and it is checked against a shape before it is spent (`ctfd_`
+and 64 hex), so nothing else reaches CTFd.
 
 ## How it works
 
@@ -495,6 +570,11 @@ python -m pytest tests -rs
 `tests/test_instancer.py` runs against a fake Docker daemon (no Docker needed);
 two Flask test clients stand in for two users, two challenges stand in for an
 event, and a handful of tests pin down exactly what a player is and is not told.
+A fake CTFd stands in for the real one where `CTFD_VERIFY` is concerned — a token
+that verifies, one CTFd has never heard of, one that never leaves the instancer
+because it is not a token at all, and a CTFd that cannot be reached (which is not
+the same as a CTFd saying no) — along with the thing the whole feature exists
+for: two browsers holding one token get one instance between them.
 `tests/test_proxy.py` runs the real proxy over real sockets against fake
 instances — key handling, path/cookie routing, hangups, and the parsing helpers.
 `tests/test_docker_integration.py` builds the real proxy and both real challenge

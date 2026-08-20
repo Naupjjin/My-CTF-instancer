@@ -51,6 +51,21 @@
   .term.idle .line { color: var(--ink-dim); }
 
   #actions { margin-top: 20px; display: flex; gap: 14px; }
+
+  /* ---- the door: a CTFd token, when the event checks them ---- */
+  .gate { border: 3px dashed var(--accent-s); padding: 12px 14px; }
+  .gate.on { border: 3px solid var(--ink); background: #f6f4fc;
+             box-shadow: 5px 5px 0 var(--tone-s); }
+  .gate .line { display: flex; gap: 8px; align-items: baseline; }
+  .gate .prompt { color: var(--tone); flex: none; }
+  .gate .note { color: var(--ink-dim); font-size: 15px; margin: 0; }
+  .gate .row { display: flex; gap: 12px; margin-top: 10px; }
+  .gate input {
+    flex: 1; min-width: 0; padding: 8px 10px;
+    font-family: 'VT323', ui-monospace, monospace; font-size: 20px;
+    color: var(--ink); background: var(--card); border: 3px solid var(--ink);
+  }
+  .gate input:focus { outline: none; border-color: var(--accent); }
 {% endblock %}
 
 {% block screen %}
@@ -74,6 +89,23 @@
           <span id="state">OFFLINE</span>
         </span>
       </div>
+
+      {% if ctfd_verify %}
+      <div class="rule">IDENTITY<span class="fill"></span></div>
+      <div class="gate {{ 'on' if ctfd_user }}" id="gate">
+        <div class="line" id="who-row" {{ '' if ctfd_user else 'hidden' }}>
+          <span class="prompt">&gt;</span>
+          <span id="who">{% if ctfd_user %}verified as {{ ctfd_user }}{% endif %}</span>
+        </div>
+        <p class="note">one instance of each challenge per CTFd account. your token
+        is in CTFd under settings &rarr; access tokens.</p>
+        <div class="row" id="ask-row" {{ 'hidden' if ctfd_user }}>
+          <input id="token" type="password" placeholder="ctfd_..." spellcheck="false"
+                 autocomplete="off" autocapitalize="off" aria-label="CTFd API token">
+          <button id="verify" class="btn"><i class="ico"></i>VERIFY</button>
+        </div>
+      </div>
+      {% endif %}
 
       <div class="rule">LEASE<span class="fill"></span></div>
       <div class="meter">
@@ -142,8 +174,19 @@ const start = document.getElementById("start");
 const stop = document.getElementById("stop");
 const error = document.getElementById("error");
 
+// The door, and only when the event checks tokens: with CTFD_VERIFY off none of
+// this is on the page and START is never gated.
+const CTFD = {{ ctfd_verify|tojson }};
+const gate = document.getElementById("gate");
+const whoRow = document.getElementById("who-row");
+const who = document.getElementById("who");
+const askRow = document.getElementById("ask-row");
+const tokenBox = document.getElementById("token");
+const verifyBtn = document.getElementById("verify");
+
 let countdown = null;
 let running = false;
+let verified = !CTFD || Boolean({{ (ctfd_user or "")|tojson }});
 
 /* ---------- rendering ---------- */
 function formatAddress(mode, host, port, key) {
@@ -212,6 +255,13 @@ function render(data) {
 }
 
 /* ---------- API ---------- */
+function setButtons() {
+  // Nothing to start until we know whose it would be. STOP is never gated: it
+  // only ever reaches an instance the session already owns.
+  start.disabled = !verified;
+  start.title = verified ? "" : "verify your CTFd token first";
+  stop.disabled = false;
+}
 async function call(path, method, working) {
   start.disabled = stop.disabled = true;
   error.textContent = "";
@@ -225,15 +275,51 @@ async function call(path, method, working) {
     if (data.error) error.textContent = data.error;
     render(data);
   } catch (e) { error.textContent = String(e); }
-  start.disabled = stop.disabled = false;
+  setButtons();
 }
 const refresh = () => call("/status", "GET");
 start.onclick = () => call("/create", "POST", "SPAWNING");   // lifetime is this challenge's ttl
 stop.onclick  = () => call("/destroy", "POST", "STOPPING");
 
-// the same three things, for people who never touch the mouse
+/* ---------- the door ---------- */
+function setVerified(name) {
+  verified = true;
+  who.textContent = "verified as " + (name || "your CTFd account");
+  whoRow.hidden = false;
+  askRow.hidden = true;
+  gate.classList.add("on");
+  setButtons();
+}
+async function checkToken() {
+  const token = tokenBox.value.trim();
+  if (!token) return;
+  verifyBtn.disabled = true;
+  error.textContent = "";
+  try {
+    const r = await fetch("/api/verify", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token }),
+    });
+    const data = await r.json();
+    if (data.error) error.textContent = data.error;
+    // The token is gone from the page either way, and a fresh /status shows
+    // whatever this account already has running -- another browser, or the one
+    // this one had before its cookie went away.
+    if (data.verified) { tokenBox.value = ""; setVerified(data.user); refresh(); }
+  } catch (e) { error.textContent = String(e); }
+  verifyBtn.disabled = false;
+}
+if (CTFD) {
+  verifyBtn.onclick = checkToken;
+  tokenBox.addEventListener("keydown", (e) => { if (e.key === "Enter") checkToken(); });
+}
+
+// the same three things, for people who never touch the mouse -- but not while
+// a token is being typed, where every letter is a letter and not a shortcut
 document.addEventListener("keydown", (e) => {
   if (e.metaKey || e.ctrlKey || e.altKey) return;
+  if (e.target.closest && e.target.closest("input, textarea")) return;
   const k = e.key.toLowerCase();
   if (k === "s" && !start.hidden && !start.disabled) start.click();
   else if (k === "x" && !stop.hidden && !stop.disabled) stop.click();

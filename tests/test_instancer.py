@@ -1,11 +1,15 @@
 """Unit tests: the instancer logic against a fake Docker daemon."""
 
+import io
 import ipaddress
+import json
 import logging
 import re
 import signal
 import threading
 import time
+import urllib.error
+import urllib.request
 
 import pytest
 from docker.errors import APIError, ImageNotFound, NotFound
@@ -233,6 +237,41 @@ class FakeClient:
         self.api = FakeAPI()
 
 
+# --- fake CTFd ----------------------------------------------------------------
+
+# What CTFd hands out: `ctfd_` and 64 hex. Two of them, so a test can watch two
+# accounts stay apart.
+GOOD = "ctfd_" + "a" * 64
+OTHER = "ctfd_" + "b" * 64
+
+
+class FakeCTFd:
+    """A CTFd that answers one question -- whose token is this -- and nothing else."""
+
+    def __init__(self):
+        self.accounts = {}
+        self.asked = []           # every request that actually left the instancer
+        self.down = False         # CTFd unreachable, rather than CTFd saying no
+        self.answer = None        # a 200 that is not CTFd's shape
+
+    def add(self, token, account_id, name):
+        self.accounts[token] = {"id": account_id, "name": name}
+        return token
+
+    def urlopen(self, request, timeout=None):
+        self.asked.append(request)
+        if self.down:
+            raise urllib.error.URLError("connection refused")
+        if self.answer is not None:
+            return io.BytesIO(json.dumps(self.answer).encode())
+        presented = request.headers.get("Authorization", "")
+        token = presented[len("Token "):] if presented.startswith("Token ") else ""
+        account = self.accounts.get(token)
+        if account is None:
+            raise urllib.error.HTTPError(request.full_url, 403, "Forbidden", {}, None)
+        return io.BytesIO(json.dumps({"success": True, "data": account}).encode())
+
+
 # --- challenges ---------------------------------------------------------------
 
 # A pool each, the way two real challenges would have one.
@@ -308,6 +347,18 @@ def other(daemon):
     return client
 
 
+@pytest.fixture
+def ctfd(monkeypatch):
+    """The event checks tokens, and there is a CTFd to check them with."""
+    fake = FakeCTFd()
+    fake.add(GOOD, 7, "player-one")
+    fake.add(OTHER, 9, "player-two")
+    monkeypatch.setattr(instancer, "CTFD_VERIFY", True)
+    monkeypatch.setattr(instancer, "CTFD_URL", "http://ctfd.test")
+    monkeypatch.setattr(urllib.request, "urlopen", fake.urlopen)
+    return fake
+
+
 # --- talking to the api -------------------------------------------------------
 
 def create(client, chal=WEB, **kwargs):
@@ -320,6 +371,17 @@ def status(client, chal=WEB):
 
 def destroy(client, chal=WEB):
     return client.post("/api/%s/destroy" % chal)
+
+
+def verify(client, token=GOOD):
+    return client.post("/api/verify", json={"token": token})
+
+
+def player():
+    """A browser that has loaded the page and said nothing yet."""
+    client = instancer.app.test_client()
+    client.get("/")
+    return client
 
 
 def lookup(client, key, chal=WEB, token=...):
@@ -440,6 +502,167 @@ def test_the_name_reaches_every_page(web, daemon, chal, monkeypatch):
     monkeypatch.setattr(instancer, "INSTANCER_NAME", "Zero")
     for path in ("/", "/c/%s" % chal.id, "/c/nope"):
         assert "ZERO" in web.get(path).get_data(as_text=True), path
+
+
+# --- who a player is (CTFd) ---------------------------------------------------
+
+def test_without_ctfd_a_browser_is_a_player(web, chal, daemon):
+    assert create(web, chal.id).get_json()["running"] is True
+
+
+def test_with_ctfd_a_browser_is_nobody_until_it_says_who(ctfd, web, chal, daemon):
+    response = create(web, chal.id)
+    assert response.status_code == 403
+    assert response.get_json()["error"] == instancer.ERROR_NO_TOKEN
+    assert instances(daemon) == []
+
+
+def test_a_verified_token_opens_the_door(ctfd, web, chal, daemon):
+    assert verify(web).get_json() == {"ctfd": True, "verified": True,
+                                      "user": "player-one"}
+    assert create(web, chal.id).get_json()["running"] is True
+    asked, = ctfd.asked
+    assert asked.full_url == "http://ctfd.test/api/v1/users/me"
+    assert asked.headers["Authorization"] == "Token " + GOOD
+
+
+def test_an_instance_is_named_after_the_account_not_the_session(ctfd, web, chal, daemon):
+    verify(web)
+    create(web, chal.id)
+    assert only_container(daemon).name.endswith("-" + instancer.ctfd_owner(7))
+
+
+def test_an_account_id_names_an_owner_the_same_way_every_time():
+    # Nothing secret goes into it and nothing per-process: an owner that moved
+    # when the instancer restarted would be a second instance for every player.
+    assert instancer.ctfd_owner(7) == instancer.ctfd_owner(7)
+    assert instancer.ctfd_owner(7) != instancer.ctfd_owner(9)
+    assert re.fullmatch(r"[0-9a-f]{16}", instancer.ctfd_owner(7))
+
+
+def test_a_token_that_is_not_one_is_never_asked_about(ctfd, web, daemon):
+    for bad in ("", "hunter2", "ctfd_" + "z" * 64, "ctfd_" + "a" * 63, GOOD + "a"):
+        response = web.post("/api/verify", json={"token": bad})
+        assert response.status_code == 403, bad
+        assert response.get_json()["error"] == instancer.ERROR_BAD_TOKEN
+    assert ctfd.asked == []
+
+
+def test_verify_without_a_token_is_not_a_crash(ctfd, web, daemon):
+    for body in ({}, {"token": None}, {"token": 7}, {"token": ["a"]}):
+        assert web.post("/api/verify", json=body).status_code == 403, body
+    assert web.post("/api/verify", data="not json",
+                    content_type="text/plain").status_code == 403
+    assert ctfd.asked == []
+
+
+def test_a_token_ctfd_does_not_know_gets_nothing(ctfd, web, chal, daemon):
+    response = verify(web, "ctfd_" + "c" * 64)
+    assert response.status_code == 403
+    assert response.get_json() == {"ctfd": True, "verified": False,
+                                   "error": instancer.ERROR_BAD_TOKEN}
+    assert create(web, chal.id).status_code == 403
+
+
+def test_a_ctfd_that_cannot_be_reached_is_not_a_no(ctfd, web, chal, daemon):
+    ctfd.down = True
+    response = verify(web)
+    assert response.status_code == 503
+    assert response.get_json()["error"] == instancer.ERROR_CTFD
+    assert create(web, chal.id).status_code == 403
+    # The token was fine all along, and says so the moment CTFd is back.
+    ctfd.down = False
+    assert verify(web).get_json()["verified"] is True
+
+
+def test_a_ctfd_that_answers_nonsense_is_our_failure_not_the_token_s(ctfd, web, daemon):
+    ctfd.answer = {"nothing": "like CTFd"}
+    response = verify(web)
+    assert response.status_code == 503
+    assert response.get_json()["error"] == instancer.ERROR_CTFD
+
+
+def test_with_nowhere_to_check_a_token_nothing_starts(ctfd, web, chal, daemon, monkeypatch):
+    monkeypatch.setattr(instancer, "CTFD_URL", "")
+    assert verify(web).status_code == 503
+    assert create(web, chal.id).status_code == 403
+    assert ctfd.asked == []
+
+
+def test_one_account_holds_one_instance_of_a_challenge(ctfd, web, other, chal, daemon):
+    verify(web)
+    verify(other)                       # the same token, in a second browser
+    first = create(web, chal.id).get_json()
+    second = create(other, chal.id).get_json()
+    assert second["key"] == first["key"]         # the same instance, handed back
+    assert len(instances(daemon)) == 1
+
+
+def test_a_fresh_cookie_does_not_buy_a_second_instance(ctfd, web, chal, daemon):
+    verify(web)
+    create(web, chal.id)
+    fresh = player()                    # cleared cookies, same account
+    verify(fresh)
+    assert status(fresh, chal.id).get_json()["running"] is True
+    assert len(instances(daemon)) == 1
+
+
+def test_one_account_still_gets_one_of_each_challenge(ctfd, web, pwn, chal, daemon):
+    verify(web)
+    assert create(web, pwn.id).get_json()["running"] is True
+    assert create(web, chal.id).get_json()["running"] is True
+    assert len(instances(daemon)) == 2
+
+
+def test_two_accounts_are_two_players(ctfd, web, other, chal, daemon):
+    verify(web)
+    verify(other, OTHER)
+    create(web, chal.id)
+    create(other, chal.id)
+    assert len(instances(daemon)) == 2
+    assert status(web, chal.id).get_json()["key"] != status(other, chal.id).get_json()["key"]
+
+
+def test_a_second_token_is_a_second_player_not_a_second_instance(ctfd, web, chal, daemon):
+    verify(web)
+    create(web, chal.id)
+    verify(web, OTHER)                  # somebody else sits down at this browser
+    assert status(web, chal.id).get_json() == idle(chal)   # and has nothing
+    assert len(instances(daemon)) == 1                     # and took nothing away
+
+
+def test_a_cookie_from_before_the_gate_is_not_an_identity(web, chal, daemon, monkeypatch):
+    # This browser was here while CTFD_VERIFY was off, and kept the session id
+    # it was given. Turning the check on does not turn that into an account.
+    monkeypatch.setattr(instancer, "CTFD_VERIFY", True)
+    assert create(web, chal.id).status_code == 403
+    assert status(web, chal.id).get_json() == idle(chal)
+    assert web.get("/api/challenges").get_json()["challenges"][0]["running"] is False
+
+
+def test_the_token_itself_is_not_kept(ctfd, web, daemon):
+    verify(web)
+    with web.session_transaction() as stored:
+        assert GOOD not in stored.values()
+        assert stored["ctfd"] == "player-one"
+
+
+def test_the_page_asks_for_a_token_and_then_says_whose_it_is(ctfd, web, chal, daemon):
+    body = web.get("/c/%s" % chal.id).get_data(as_text=True)
+    assert "IDENTITY" in body and "VERIFY" in body
+    assert "CTFd tokens" in web.get("/").get_data(as_text=True)
+    verify(web)
+    assert "verified as player-one" in web.get("/c/%s" % chal.id).get_data(as_text=True)
+    assert "verified as" in web.get("/").get_data(as_text=True)
+
+
+def test_without_ctfd_no_page_asks_for_anything(web, chal, daemon):
+    for path in ("/", "/c/%s" % chal.id):
+        assert "IDENTITY" not in web.get(path).get_data(as_text=True), path
+
+
+def test_verify_is_a_no_op_when_the_event_does_not_check_tokens(web, daemon):
+    assert verify(web).get_json() == {"ctfd": False, "verified": True, "user": None}
 
 
 # --- challenges (each challenge's own config.yml) -----------------------------

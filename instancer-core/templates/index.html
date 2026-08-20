@@ -32,6 +32,9 @@
   }
   .chal .reach .cap { color: var(--accent); }
   .empty { color: var(--ink-dim); border: 3px dotted var(--accent-s); padding: 18px; }
+  .gate { color: var(--ink-dim); font-size: 16px; margin: 0 0 12px;
+          border: 3px dotted var(--accent-s); padding: 10px 12px; }
+  .gate b { color: var(--accent); font-weight: normal; }
 {% endblock %}
 
 {% block screen %}
@@ -39,6 +42,16 @@
 
     <div id="console">
       <div class="rule">CHALLENGES<span class="fill"></span><span class="count" id="tally">--</span></div>
+
+      {% if ctfd_verify %}
+      <p class="gate">
+        {%- if ctfd_user -%}
+        verified as <b>{{ ctfd_user }}</b> &middot; one instance of each challenge per CTFd account
+        {%- else -%}
+        this event checks CTFd tokens: open a challenge and paste yours before you start it
+        {%- endif -%}
+      </p>
+      {% endif %}
 
       {% if challenges %}
       <div class="rack">

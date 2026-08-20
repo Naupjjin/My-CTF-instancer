@@ -108,6 +108,22 @@
       </div>
       {% endif %}
 
+      <div id="work" hidden>
+        <div class="rule">PROOF OF WORK<span class="fill"></span></div>
+        <div class="gate on">
+          <div class="line">
+            <span class="prompt">$</span>
+            <a id="powcmd" class="copy" title="click to copy"></a>
+          </div>
+          <p class="note">run it, then paste what it prints. every START asks again.</p>
+          <div class="row">
+            <input id="powin" placeholder="s..." spellcheck="false"
+                   autocomplete="off" autocapitalize="off" aria-label="proof of work answer">
+            <button id="powgo" class="btn"><i class="ico"></i>SUBMIT</button>
+          </div>
+        </div>
+      </div>
+
       <div class="rule">LEASE<span class="fill"></span></div>
       <div class="meter">
         <div class="face">
@@ -184,6 +200,11 @@ const who = document.getElementById("who");
 const askRow = document.getElementById("ask-row");
 const tokenBox = document.getElementById("token");
 const verifyBtn = document.getElementById("verify");
+
+const work = document.getElementById("work");
+const powCmd = document.getElementById("powcmd");
+const powIn = document.getElementById("powin");
+const powGo = document.getElementById("powgo");
 
 let countdown = null;
 let running = false;
@@ -263,7 +284,7 @@ function setButtons() {
   start.title = verified ? "" : "verify your CTFd token first";
   stop.disabled = false;
 }
-async function call(path, method, working) {
+async function call(path, method, working, body) {
   start.disabled = stop.disabled = true;
   error.textContent = "";
   if (working) {
@@ -271,9 +292,15 @@ async function call(path, method, working) {
     state.textContent = working; state.className = "busy";
   }
   try {
-    const r = await fetch("/api/" + encodeURIComponent(CHAL) + path, { method });
+    const options = { method };
+    if (body) {
+      options.headers = { "Content-Type": "application/json" };
+      options.body = JSON.stringify(body);
+    }
+    const r = await fetch("/api/" + encodeURIComponent(CHAL) + path, options);
     const data = await r.json();
     if (data.error) error.textContent = data.error;
+    showWork(data.pow);
     render(data);
   } catch (e) { error.textContent = String(e); }
   setButtons();
@@ -281,6 +308,18 @@ async function call(path, method, working) {
 const refresh = () => call("/status", "GET");
 start.onclick = () => call("/create", "POST", "SPAWNING");   // lifetime is this challenge's ttl
 stop.onclick  = () => call("/destroy", "POST", "STOPPING");
+
+/* ---------- the work ---------- */
+function showWork(pow) {
+  work.hidden = !pow;
+  if (!pow) return;
+  // redpwn's solver, kctf's challenge format -- which is what it eats.
+  powCmd.textContent = "curl -sSfL https://pwn.red/pow | sh -s " + pow.challenge;
+  powIn.value = "";
+  powIn.focus();
+}
+powGo.onclick = () => call("/create", "POST", "SPAWNING", { pow: powIn.value.trim() });
+powIn.addEventListener("keydown", (e) => { if (e.key === "Enter") powGo.click(); });
 
 /* ---------- the door ---------- */
 function setVerified(name) {

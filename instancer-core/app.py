@@ -42,6 +42,8 @@ import yaml
 from docker.errors import APIError, DockerException, ImageNotFound, NotFound
 from flask import Flask, jsonify, render_template, request, session
 
+import sloth
+
 # Where the challenges are, one directory each. The directory name is the
 # challenge id: it is in the URL, and in the name of everything the challenge is
 # made of, so it is held to a shape.
@@ -111,6 +113,15 @@ CTFD_SCOPES = ("user", "team")
 # a pasted password costs CTFd nothing.
 CTFD_TOKEN = re.compile(r"\Actfd_[0-9a-f]{64}\Z")
 
+# The work a player does before an instance is created: one command, ten seconds
+# or so, paid again on every START. On unless POW_VERIFY says otherwise -- it is
+# what stops a script from taking the whole pool while people are still reading.
+# The difficulty is iterations, and what they cost depends on the solver: about
+# 10s with the one at pwn.red, several times that in plain Python.
+POW_VERIFY = os.environ.get("POW_VERIFY", "y").strip().lower() not in ("n", "no", "0", "false", "off")
+POW_DIFFICULTY = int(os.environ.get("POW_DIFFICULTY", "19000"))
+POW_TTL = int(os.environ.get("POW_TTL", "120"))
+
 # What a challenge gets when its config.yml does not say. Where an instance
 # lives is the challenge's business now -- its own pool and its own port range,
 # written next to its Dockerfile -- so these are only the shape of a sensible
@@ -168,6 +179,7 @@ ERROR_NO_TOKEN = "verify your CTFd token before starting anything"
 ERROR_BAD_TOKEN = "CTFd does not know that token"
 ERROR_CTFD = "could not check your token with CTFd, try again in a moment"
 ERROR_NO_TEAM = "join a team in CTFd first"
+ERROR_POW = "that proof of work did not check out -- here is a new one"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("instancer")
@@ -532,6 +544,38 @@ def owner_id():
         session.permanent = True
         session["owner"] = secrets.token_hex(8)
     return session["owner"]
+
+
+# --- proof of work ------------------------------------------------------------
+
+# One outstanding challenge per owner per challenge, spent the moment it is
+# solved. Two minutes of life each, so the table stays small on its own.
+pow_lock = threading.Lock()
+pow_pending = {}
+
+
+def pow_issue(chal, owner):
+    """A challenge for this owner, replacing whatever they had."""
+    challenge = sloth.new_challenge(POW_DIFFICULTY)
+    now = time.time()
+    with pow_lock:
+        for key, (_, expires) in list(pow_pending.items()):
+            if expires <= now:
+                del pow_pending[key]
+        pow_pending[(chal, owner)] = (challenge, now + POW_TTL)
+    return challenge
+
+
+def pow_spend(chal, owner, answer):
+    """True if this answers what that owner was given. Good once."""
+    with pow_lock:
+        pending = pow_pending.get((chal, owner))
+    if pending is None or pending[1] <= time.time():
+        return False
+    if not sloth.verify(pending[0], answer):
+        return False
+    with pow_lock:
+        return pow_pending.pop((chal, owner), None) is not None
 
 
 def container_name(chal, owner):
@@ -1032,6 +1076,13 @@ def challenge_json(chal, owner):
     }
 
 
+def pow_json(chal, owner, error=None):
+    """What a player gets instead of an instance: the work to do first."""
+    return jsonify(running=False, mode=chal.mode, error=error,
+                   pow={"challenge": pow_issue(chal.id, owner),
+                        "difficulty": POW_DIFFICULTY})
+
+
 def no_such_challenge():
     return jsonify(running=False, error=ERROR_NO_CHAL), 404
 
@@ -1139,7 +1190,15 @@ def create(chal):
     with owner_lock(chal, owner):
         container = get_instance(chal, owner)
         if container is not None:
+            # Already yours: nothing is being handed out, so nothing is owed.
             return instance_json(found, container)
+
+        if POW_VERIFY:
+            answer = (request.get_json(silent=True) or {}).get("pow")
+            if not isinstance(answer, str):
+                return pow_json(found, owner), 428
+            if not pow_spend(chal, owner, answer):
+                return pow_json(found, owner, ERROR_POW), 428
 
         # Clear any orphan network left behind by a previous life of this owner.
         remove_network(chal, owner)
@@ -1347,6 +1406,8 @@ def startup():
             log.warning("unknown CTFD_SCOPE %r, using user", CTFD_SCOPE)
         log.info("CTFd verification on against %s: one instance of each challenge "
                  "per %s", CTFD_URL, "team" if CTFD_SCOPE == "team" else "account")
+    if POW_VERIFY:
+        log.info("proof of work on: difficulty %d, %ds to answer", POW_DIFFICULTY, POW_TTL)
     if not CHALLENGES:
         log.error("no usable challenge in %s: there is nothing to serve", CHALLENGES_DIR)
     try:

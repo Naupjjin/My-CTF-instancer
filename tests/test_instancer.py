@@ -15,6 +15,7 @@ import pytest
 from docker.errors import APIError, ImageNotFound, NotFound
 
 import app as instancer
+import sloth
 
 TOKEN = "test-proxy-token"
 CONTROL = "ctf-control-test"
@@ -309,6 +310,8 @@ def daemon(monkeypatch):
         WEB: make_challenge(WEB, mode="http", port=1338),
     })
     monkeypatch.setattr(instancer.app, "secret_key", "test-secret")
+    monkeypatch.setattr(instancer, "POW_VERIFY", False)
+    instancer.pow_pending.clear()
     # What startup() leaves behind, and what every create assumes: each
     # challenge already has the proxy that is its only door.
     for challenge in instancer.CHALLENGES.values():
@@ -365,6 +368,14 @@ def ctfd(monkeypatch):
 
 
 @pytest.fixture
+def pow_on(daemon, monkeypatch):
+    """Proof of work required, at a difficulty a test can afford to solve."""
+    monkeypatch.setattr(instancer, "POW_VERIFY", True)
+    monkeypatch.setattr(instancer, "POW_DIFFICULTY", 30)
+    return instancer.pow_pending
+
+
+@pytest.fixture
 def team(ctfd, monkeypatch):
     """The same CTFd, scoped to teams: GOOD and MATE are one team, OTHER another."""
     monkeypatch.setattr(instancer, "CTFD_SCOPE", "team")
@@ -387,6 +398,12 @@ def destroy(client, chal=WEB):
 
 def verify(client, token=GOOD):
     return client.post("/api/verify", json={"token": token})
+
+
+def work(client, chal=WEB):
+    """Ask for an instance, do the work it asks for, ask again."""
+    asked = create(client, chal).get_json()["pow"]
+    return create(client, chal, json={"pow": sloth.solve(asked["challenge"])})
 
 
 def player():
@@ -733,6 +750,143 @@ def test_the_team_scope_shows_on_the_page(team, web, chal, daemon):
     assert "per team" in text("/c/%s" % chal.id)
     verify(web, GOOD)
     assert "per team" in text("/")
+
+
+# --- proof of work ------------------------------------------------------------
+
+def test_without_the_work_there_is_no_instance(pow_on, web, chal, daemon):
+    response = create(web, chal.id)
+    assert response.status_code == 428
+    assert response.get_json()["pow"]["difficulty"] == 30
+    assert instances(daemon) == []
+
+
+def test_the_work_done_gets_an_instance(pow_on, web, chal, daemon):
+    assert work(web, chal.id).get_json()["running"] is True
+    assert len(instances(daemon)) == 1
+
+
+def test_a_wrong_answer_is_refused_and_asked_again(pow_on, web, chal, daemon):
+    asked = create(web, chal.id).get_json()["pow"]["challenge"]
+    response = create(web, chal.id, json={"pow": sloth.encode_challenge([12345])})
+    assert response.status_code == 428
+    assert response.get_json()["error"] == instancer.ERROR_POW
+    assert response.get_json()["pow"]["challenge"] != asked   # a new one, not that one
+    assert instances(daemon) == []
+
+
+def test_a_scribbled_answer_is_not_a_crash(pow_on, web, chal, daemon):
+    create(web, chal.id)
+    for bad in ("", "s.", "s.!!!!", "nonsense", "s." + "A" * 600, 7, None):
+        assert create(web, chal.id, json={"pow": bad}).status_code == 428, bad
+    assert instances(daemon) == []
+
+
+def test_an_answer_is_good_once(pow_on, web, chal, daemon):
+    asked = create(web, chal.id).get_json()["pow"]["challenge"]
+    answer = sloth.solve(asked)
+    assert create(web, chal.id, json={"pow": answer}).get_json()["running"] is True
+    destroy(web, chal.id)
+    again = create(web, chal.id, json={"pow": answer})
+    assert again.status_code == 428
+    assert instances(daemon) == []
+
+
+def test_an_answer_is_no_good_to_anybody_else(pow_on, web, other, chal, daemon):
+    asked = create(web, chal.id).get_json()["pow"]["challenge"]
+    create(other, chal.id)                      # they get one of their own
+    stolen = create(other, chal.id, json={"pow": sloth.solve(asked)})
+    assert stolen.status_code == 428
+    assert instances(daemon) == []
+
+
+def test_an_answer_is_no_good_at_another_challenge(pow_on, web, pwn, chal, daemon):
+    asked = create(web, chal.id).get_json()["pow"]["challenge"]
+    create(web, pwn.id)
+    elsewhere = create(web, pwn.id, json={"pow": sloth.solve(asked)})
+    assert elsewhere.status_code == 428
+    assert instances(daemon) == []
+
+
+def test_the_work_goes_stale(pow_on, web, chal, daemon, monkeypatch):
+    monkeypatch.setattr(instancer, "POW_TTL", 0)          # stale as it is handed out
+    asked = create(web, chal.id).get_json()["pow"]["challenge"]
+    response = create(web, chal.id, json={"pow": sloth.solve(asked)})
+    assert response.status_code == 428
+    assert instances(daemon) == []
+
+
+def test_stale_work_does_not_pile_up(pow_on, web, chal, daemon, monkeypatch):
+    monkeypatch.setattr(instancer, "POW_TTL", 0)
+    for _ in range(3):
+        create(web, chal.id)
+    instancer.pow_issue(chal.id, "somebody")               # sweeps on the way past
+    assert list(instancer.pow_pending) == [(chal.id, "somebody")]
+
+
+def test_an_instance_you_already_have_costs_nothing(pow_on, web, chal, daemon):
+    work(web, chal.id)
+    again = create(web, chal.id)                # no answer, and none asked for
+    assert again.status_code == 200
+    assert again.get_json()["running"] is True
+    assert "pow" not in again.get_json()
+
+
+def test_the_work_is_asked_for_after_the_token(ctfd, pow_on, web, chal, daemon):
+    # Who first, then what: an unverified player is turned away before being set
+    # to work for nothing.
+    assert create(web, chal.id).status_code == 403
+    verify(web)
+    assert create(web, chal.id).status_code == 428
+
+
+def test_off_by_default_nothing_is_asked(web, chal, daemon):
+    response = create(web, chal.id)
+    assert response.status_code == 200
+    assert "pow" not in response.get_json()
+
+
+def test_the_page_has_somewhere_to_put_the_answer(web, chal, daemon):
+    body = web.get("/c/%s" % chal.id).get_data(as_text=True)
+    assert "PROOF OF WORK" in body
+    assert "pwn.red/pow" in body
+
+
+# --- proof of work: the algorithm itself --------------------------------------
+
+def test_a_solution_solves_its_own_challenge_only():
+    one, two = sloth.new_challenge(20), sloth.new_challenge(20)
+    assert sloth.verify(one, sloth.solve(one))
+    assert not sloth.verify(two, sloth.solve(one))
+
+
+def test_checking_is_the_cheap_half():
+    # Not a benchmark -- just that the squaring really is the inverse of the
+    # rooting, at a difficulty where an off-by-one would show.
+    challenge = sloth.new_challenge(101)
+    diff, x = sloth.decode_challenge(challenge)
+    y, = sloth.decode_challenge(sloth.solve(challenge))
+    assert sloth.sloth_square(y, diff, sloth.MODULUS) in (x, sloth.MODULUS - x)
+
+
+def test_the_fast_reduction_is_the_slow_one(daemon):
+    # sloth_square reduces with a shift and an add because the modulus is
+    # Mersenne; it has to agree with the plain modulo it replaces.
+    p = sloth.MODULUS
+    for start in (0, 1, 2, p - 1, p // 3, 2 ** 1278):
+        slow = start
+        for _ in range(50):
+            slow = pow(slow ^ 1, 2, p)
+        assert sloth.sloth_square(start, 50, p) == slow
+
+
+def test_it_is_kctfs_format():
+    # Pinned, so this keeps solving with redpwnpow and kctf-pow. Generated by
+    # google/kctf's own pow.py.
+    challenge = "s.AAiI.AAAgltKMMc19XgwBdgfwTbuH"
+    parts = [2184, 43318410807270238229934003759856073607]
+    assert sloth.decode_challenge(challenge) == parts
+    assert sloth.encode_challenge(parts) == challenge
 
 
 # --- challenges (each challenge's own config.yml) -----------------------------

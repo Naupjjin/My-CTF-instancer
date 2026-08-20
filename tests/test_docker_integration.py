@@ -134,6 +134,9 @@ CONFIG = {
     "CONTROL_NETWORK": CONTROL_NET,
     "PROXY_TOKEN": TOKEN,
     "CHALLENGES": {},
+    # What is under test here is Docker, not the door. The proof of work has its
+    # own tests, and paying it on every create would be most of the runtime.
+    "POW_VERIFY": False,
 }
 
 

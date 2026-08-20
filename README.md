@@ -226,9 +226,12 @@ Defaults in brackets. The instancer:
 | `CTFD_URL` | unset | the CTFd to ask whose token it is; required when the above is on |
 | `CTFD_SCOPE` | `user` | `team` gives one instance per CTFd *team* instead of per account |
 | `CTFD_TIMEOUT` | `5` | seconds to wait for CTFd to answer |
+| `POW_VERIFY` | `y` | proof of work before an instance is created; `n` turns it off |
+| `POW_DIFFICULTY` | `19000` | iterations of work — roughly 10s with the solver at pwn.red |
+| `POW_TTL` | `120` | seconds a challenge stays answerable |
 
-Only seven of these are written in `docker-compose.yml` — the two secrets, the UI
-port, the name, `PROXY_HOST`, and the two CTFd settings. The rest have defaults
+Only nine of these are written in `docker-compose.yml` — the two secrets, the UI
+port, the name, `PROXY_HOST`, the CTFd settings and the proof of work. The rest have defaults
 that are already right for the compose layout, and nothing about a *challenge* is
 there at all: there is one environment and many challenges, so a per-challenge
 value has nowhere to live except with the challenge.
@@ -325,6 +328,59 @@ this on mid-event is safe: a session id minted while it was off is a cookie, not
 an account, and does not become one because the setting changed underneath it —
 those players are asked for a token like everybody else. Instances they already
 had keep running under the old owner id and expire on schedule.
+
+### Proof of work — on by default
+
+Before an instance is created the player runs one command and pastes what it
+prints:
+
+```
+$ curl -sSfL https://pwn.red/pow | sh -s s.AAiI.AADVehQD8WTA1hLoIeDWuseT
+s.AABmNe40aQR43tTd/7JDfjOj…
+```
+
+Ten seconds of somebody's laptop is nothing to a person reading a challenge, and
+everything to a script opening instances in a loop — which is the entire point.
+`POW_VERIFY=n` turns it off.
+
+The scheme is [kCTF's](https://github.com/google/kctf): repeated modular square
+roots mod `2^1279-1`, encoded `s.<b64(difficulty)>.<b64(x)>`. Two things make it
+the right shape for this.
+
+**It cannot be parallelised.** Each root waits on the one before it, so a team
+with a 64-core server gets the answer no sooner than one with a laptop. A
+leading-zeros hash — the usual CTF proof of work — rewards whoever brought the
+most hardware, which is the opposite of what a gate at the door is for.
+
+**Checking is cheap.** The instancer squares the answer back to where the roots
+started: about 25ms against ten seconds of solving. The modulus is Mersenne, so
+the reduction inside that loop is a shift and an add rather than a division.
+
+Because it is kCTF's format exactly, players use tools they already have —
+[redpwnpow](https://github.com/redpwn/pow) (the `pwn.red/pow` one-liner above),
+[kctf-pow](https://github.com/Aplet123/kctf-pow), or Google's own `pow.py`. The
+instancer generates and checks; it never ships a solver. **This does mean players
+need to reach `pwn.red`** — worth knowing before a venue with a locked-down
+network.
+
+`POW_DIFFICULTY` is iterations, and what they cost depends on whose solver:
+
+| difficulty | `pwn.red/pow`, gmpy2 | plain Python | the instancer checks |
+| --- | --- | --- | --- |
+| 2000 | ~1s | ~9s | 3ms |
+| 10000 | ~5s | ~45s | 14ms |
+| **19000** | **~10s** | ~85s | 25ms |
+
+A challenge is minted per player per challenge, answerable for `POW_TTL`
+seconds, and **good exactly once** — solving it again after destroying the
+instance does not work, and neither does using a teammate's. A wrong answer gets
+a `428` and a *new* challenge, so a guess costs the full ten seconds again.
+
+Two things it deliberately does not ask for. An instance you **already have** is
+handed back without any work: nothing is being created, and the alternative is
+punishing a double-click. And with `CTFD_VERIFY` on the **token is checked
+first** — being sent away to compute for ten seconds and *then* told to log in
+would be a poor trade.
 
 ## Challenge requirements
 
@@ -445,11 +501,13 @@ the log.
 | `GET /api/challenges` | every challenge, and whether you have one running |
 | `POST /api/verify` | `{"token": "ctfd_…"}` → `{"ctfd": true, "verified": true, "user": ...}`; `403` for a token CTFd does not know — or, in team scope, an account with no team — `503` when CTFd could not be asked. Only meaningful with `CTFD_VERIFY` on |
 | `GET /api/<chal>/status` | your instance of it, or `{"running": false, ...}` |
-| `POST /api/<chal>/create` | your instance; returns the existing one if you already have it, `403`/`503`/`500` + `{"running": false, "error": ...}` on failure |
+| `POST /api/<chal>/create` | your instance; returns the existing one if you already have it, `403`/`428`/`503`/`500` + `{"running": false, "error": ...}` on failure |
 | `POST /api/<chal>/destroy` | `{"running": false, ...}`, also when you had nothing running |
 | `GET /internal/route/<chal>/<key>` | `{"host": ..., "port": ...}` for that challenge's proxy; `404` without its `X-Proxy-Token` |
 
-`POST /api/<chal>/create` takes no parameters. Instance lifetime is the
+`POST /api/<chal>/create` takes one parameter and only when `POW_VERIFY` is on:
+`{"pow": "s.…"}`, the answer to the challenge a bare `create` comes back with as
+`428` + `{"pow": {"challenge": ..., "difficulty": ...}}`. Instance lifetime is the
 challenge's `ttl` and only that: a request cannot ask for a longer one, so a body
 is ignored, and the only way to change a lifetime is to edit the challenge's
 config.yml and restart.

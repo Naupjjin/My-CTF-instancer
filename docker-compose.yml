@@ -53,6 +53,12 @@ services:
       CTFD_VERIFY: ${CTFD_VERIFY:-n}
       CTFD_URL: ${CTFD_URL:-}
       CTFD_SCOPE: ${CTFD_SCOPE:-user}
+      # On unless this says "n": before an instance is created the player runs
+      # one command and pastes the answer. Ten seconds for a person, ten seconds
+      # every time for a script. Difficulty is iterations -- raise it and the
+      # wait goes up with it.
+      POW_VERIFY: ${POW_VERIFY:-y}
+      POW_DIFFICULTY: ${POW_DIFFICULTY:-19000}
       # Challenge and proxy images are built once, only if missing, so startup is
       # instant on every boot after the first. Set this after editing a challenge
       # to rebuild them on the next start.

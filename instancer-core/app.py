@@ -97,21 +97,18 @@ PORT_ENV = os.environ.get("PORT_ENV", "CHAL_PORT")
 # why it is an environment variable and not a file of its own.
 INSTANCER_NAME = os.environ.get("INSTANCER_NAME", "SpawnZero")
 
-# Whether a player has to say who they are, and to whom. Off unless CTFD_VERIFY
-# is "y": with it on a player is not a browser session but a CTFd account -- they
-# paste an API token, we ask CTFd whose it is, and everything they start belongs
-# to that account. That is the point of asking. A session is free to mint again,
-# an account is not, so one token holds one instance of each challenge and
-# clearing cookies buys no second one.
-#
-# One deployment, one CTFd, so this lives here and not in a challenge's
-# config.yml -- there is nowhere in a challenge for a per-event value.
+# Who a player is. Off unless CTFD_VERIFY is "y", and then a player is a CTFd
+# account rather than a browser session: one token holds one instance of each
+# challenge, and clearing cookies buys no second one. CTFD_SCOPE=team makes that
+# one per team, so four teammates share the instance instead of taking four.
 CTFD_VERIFY = os.environ.get("CTFD_VERIFY", "").strip().lower() in ("y", "yes", "1", "true", "on")
 CTFD_URL = os.environ.get("CTFD_URL", "").rstrip("/")
+CTFD_SCOPE = os.environ.get("CTFD_SCOPE", "user").strip().lower()
 CTFD_TIMEOUT = int(os.environ.get("CTFD_TIMEOUT", "5"))
+CTFD_SCOPES = ("user", "team")
 
 # What CTFd hands out under Settings -> Access Tokens. Checked before we ask, so
-# a pasted password, a stray newline or a bored player costs CTFd nothing.
+# a pasted password costs CTFd nothing.
 CTFD_TOKEN = re.compile(r"\Actfd_[0-9a-f]{64}\Z")
 
 # What a challenge gets when its config.yml does not say. Where an instance
@@ -170,6 +167,7 @@ ERROR_NO_CHAL = "no such challenge"
 ERROR_NO_TOKEN = "verify your CTFd token before starting anything"
 ERROR_BAD_TOKEN = "CTFd does not know that token"
 ERROR_CTFD = "could not check your token with CTFd, try again in a moment"
+ERROR_NO_TEAM = "join a team in CTFd first"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("instancer")
@@ -468,16 +466,11 @@ class CTFdUnreachable(Exception):
 
 
 def ctfd_account(token):
-    """Whose token is this? Returns (id, name), or None if CTFd does not know it.
+    """The CTFd account a token belongs to, or None if CTFd does not know it.
 
-    One question, `GET /api/v1/users/me` carrying the token, and it is the only
-    one worth asking: CTFd answers it for the account the token belongs to and
-    for nobody else, so a 200 is both "this token is real" and "this is who".
-
-    A refusal is an answer -- the token is not one. A timeout or a connection
-    error is not, and is raised rather than folded into one: an event whose CTFd
-    blinks for a moment must not hand every player a new identity, and a player
-    must not lose an instance to our network trouble.
+    `users/me` is the only question worth asking: CTFd answers it for the account
+    the token belongs to and nobody else. A refusal is an answer; a CTFd that
+    cannot be reached is not, and raises instead of being read as "no".
     """
     ask = urllib.request.Request(
         "%s/api/v1/users/me" % CTFD_URL,
@@ -494,38 +487,37 @@ def ctfd_account(token):
         raise CTFdUnreachable(exc)
     data = answer.get("data") if isinstance(answer, dict) else None
     if not isinstance(data, dict) or data.get("id") is None:
-        # A 200 that is not CTFd's shape: a login page, a proxy error, the wrong
-        # URL. Not the player's fault and not their token's, so it is our
-        # failure, not their refusal.
+        # A 200 that is not CTFd's shape: a login page, the wrong URL. Ours to
+        # fix, not the token's fault.
         log.error("%s answered a token check with %r", CTFD_URL, answer)
         raise CTFdUnreachable("unrecognisable answer")
-    return data["id"], str(data.get("name") or data["id"])
+    return data
 
 
-def ctfd_owner(account_id):
-    """The owner id of a CTFd account: what its container and network are named
-    after, in place of a session id.
+def ctfd_owner(kind, ident):
+    """The owner id of a CTFd user or team: what its containers are named after.
 
-    Plain SHA-256 of the account id and nothing secret, because it has to be the
-    same id tomorrow. An owner that changed with the process -- or with the
-    cookie -- would hand the same player a second instance every time the
-    instancer came back up, which is the one thing asking for a token is for. It
-    is a name and never a credential: the key is the credential, and there is a
-    fresh one per instance.
+    Nothing secret and nothing per-process goes in, so it is the same id after a
+    restart -- an owner that moved would be a second instance for every player.
     """
-    return hashlib.sha256(("ctfd|%s" % account_id).encode()).hexdigest()[:16]
+    return hashlib.sha256(("ctfd-%s|%s" % (kind, ident)).encode()).hexdigest()[:16]
+
+
+def ctfd_identity(account):
+    """(owner, name) for a verified account, or None if it needs a team and has
+    none. In team scope the owner is the team, so teammates share one instance."""
+    name = str(account.get("name") or account["id"])
+    if CTFD_SCOPE != "team":
+        return ctfd_owner("user", account["id"]), name
+    team = account.get("team_id")
+    return (ctfd_owner("team", team), name) if team is not None else None
 
 
 def current_owner():
     """Who is asking, without minting anything for them.
 
-    One owner holds at most one instance of each challenge, and that is the whole
-    of the bookkeeping: the owner id is in the name of the container and of the
-    network, so a second one cannot quietly exist.
-
-    With CTFd on, an owner is an account CTFd said yes to and nothing else -- a
-    session id minted before verification was switched on is a cookie, not an
-    identity, and does not become one because the setting changed underneath it.
+    With CTFd on that is an account CTFd said yes to: a session id minted before
+    verification was switched on is a cookie, not an identity.
     """
     if CTFD_VERIFY and not session.get("ctfd"):
         return None
@@ -533,11 +525,7 @@ def current_owner():
 
 
 def owner_id():
-    """Same, but a browser that has not been here before gets an id.
-
-    Without CTFd that is all an owner is, minted on first use. With CTFd there
-    is nothing to mint: an owner arrives through /api/verify or not at all.
-    """
+    """Same, but without CTFd a browser that has not been here gets an id."""
     if CTFD_VERIFY:
         return current_owner()
     if "owner" not in session:
@@ -1052,9 +1040,9 @@ def no_such_challenge():
 
 @app.context_processor
 def player():
-    """What every page is told about whoever is reading it: whether this event
-    checks CTFd tokens at all, and the name on the one it was shown."""
-    return {"ctfd_verify": CTFD_VERIFY, "ctfd_user": session.get("ctfd")}
+    """What every page is told about whoever is reading it."""
+    return {"ctfd_verify": CTFD_VERIFY, "ctfd_user": session.get("ctfd"),
+            "ctfd_scope": CTFD_SCOPE}
 
 
 @app.get("/")
@@ -1079,22 +1067,16 @@ def challenge_page(chal):
 
 @app.post("/api/verify")
 def verify():
-    """Trade a CTFd API token for an identity. The only route that decides who
-    somebody is, and it only exists to be used when CTFD_VERIFY is on.
+    """Trade a CTFd API token for an identity.
 
-    What it keeps is the account, not the token: the token is read once, spent
-    on the one question CTFd can answer about it, and dropped. We have no use
-    for it afterwards and no business holding it.
-
-    Verifying again is a different player sitting down at the same browser, not
-    a way to hold two instances at once. What the last one had stays theirs --
-    under their own owner id, on their own clock -- and runs out its ttl.
+    The token is read once, spent on the one question CTFd can answer about it,
+    and dropped; the session keeps the account. Verifying again is a different
+    player sitting down, not a second instance: the last one's stays theirs.
     """
     if not CTFD_VERIFY:
         return jsonify(ctfd=False, verified=True, user=None)
     if not CTFD_URL:
-        log.error("CTFD_VERIFY is on but CTFD_URL is not set: there is nowhere to "
-                  "check a token, so nobody can start anything")
+        log.error("CTFD_VERIFY is on but CTFD_URL is not set: no token can be checked")
         return jsonify(ctfd=True, verified=False, error=ERROR_CTFD), 503
     token = (request.get_json(silent=True) or {}).get("token")
     token = token.strip() if isinstance(token, str) else ""
@@ -1106,12 +1088,14 @@ def verify():
         return jsonify(ctfd=True, verified=False, error=ERROR_CTFD), 503
     if account is None:
         return jsonify(ctfd=True, verified=False, error=ERROR_BAD_TOKEN), 403
-    account_id, name = account
+    identity = ctfd_identity(account)
+    if identity is None:
+        return jsonify(ctfd=True, verified=False, error=ERROR_NO_TEAM), 403
+    owner, name = identity
     session.permanent = True
-    session["owner"] = ctfd_owner(account_id)
+    session["owner"] = owner
     session["ctfd"] = name
-    log.info("CTFd account %s (%s) verified, owner %s", account_id, name,
-             session["owner"])
+    log.info("verified %s (%s scope), owner %s", name, CTFD_SCOPE, owner)
     return jsonify(ctfd=True, verified=True, user=name)
 
 
@@ -1356,11 +1340,13 @@ def startup():
         log.warning("PROXY_TOKEN not set: every key lookup is refused, so no player "
                     "can get through any proxy")
     if CTFD_VERIFY and not CTFD_URL:
-        log.error("CTFD_VERIFY is on but CTFD_URL is not set: there is nowhere to "
-                  "check a token, and a token is now what starting anything takes")
+        log.error("CTFD_VERIFY is on but CTFD_URL is not set: no token can be "
+                  "checked, and a token is now what starting anything takes")
     elif CTFD_VERIFY:
-        log.info("CTFd verification on: a player is an account at %s, and one "
-                 "account holds one instance of each challenge", CTFD_URL)
+        if CTFD_SCOPE not in CTFD_SCOPES:
+            log.warning("unknown CTFD_SCOPE %r, using user", CTFD_SCOPE)
+        log.info("CTFd verification on against %s: one instance of each challenge "
+                 "per %s", CTFD_URL, "team" if CTFD_SCOPE == "team" else "account")
     if not CHALLENGES:
         log.error("no usable challenge in %s: there is nothing to serve", CHALLENGES_DIR)
     try:

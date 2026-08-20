@@ -45,14 +45,14 @@ services:
       # this page (a second host, a DNS name). Empty = same host as the UI. A
       # challenge may override it in its own config.yml.
       PROXY_HOST: ${PROXY_HOST:-}
-      # Optional, and off unless this says "y": with it on a player is a CTFd
-      # account rather than a browser session. They paste an API token, we ask
-      # CTFd whose it is, and one account holds one instance of each challenge --
-      # so a second browser gets the same instance back instead of a second one.
-      # CTFD_URL is where to ask; with it empty nothing can be checked, and
-      # nothing can be started. Leave both alone to run without CTFd.
+      # Off unless this says "y": with it on a player is a CTFd account rather
+      # than a browser session, and one account holds one instance of each
+      # challenge. CTFD_SCOPE=team makes that one per team instead.
+      # CTFD_URL is asked from inside this container, so a CTFd on this machine
+      # is not 127.0.0.1 -- that is this container.
       CTFD_VERIFY: ${CTFD_VERIFY:-n}
       CTFD_URL: ${CTFD_URL:-}
+      CTFD_SCOPE: ${CTFD_SCOPE:-user}
       # Challenge and proxy images are built once, only if missing, so startup is
       # instant on every boot after the first. Set this after editing a challenge
       # to rebuild them on the next start.

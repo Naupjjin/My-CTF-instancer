@@ -243,6 +243,8 @@ class FakeClient:
 # accounts stay apart.
 GOOD = "ctfd_" + "a" * 64
 OTHER = "ctfd_" + "b" * 64
+MATE = "ctfd_" + "c" * 64      # a different account, on GOOD's team
+NOTEAM = "ctfd_" + "d" * 64    # a real account that has not joined one
 
 
 class FakeCTFd:
@@ -254,8 +256,8 @@ class FakeCTFd:
         self.down = False         # CTFd unreachable, rather than CTFd saying no
         self.answer = None        # a 200 that is not CTFd's shape
 
-    def add(self, token, account_id, name):
-        self.accounts[token] = {"id": account_id, "name": name}
+    def add(self, token, account_id, name, team=None):
+        self.accounts[token] = {"id": account_id, "name": name, "team_id": team}
         return token
 
     def urlopen(self, request, timeout=None):
@@ -351,12 +353,22 @@ def other(daemon):
 def ctfd(monkeypatch):
     """The event checks tokens, and there is a CTFd to check them with."""
     fake = FakeCTFd()
-    fake.add(GOOD, 7, "player-one")
-    fake.add(OTHER, 9, "player-two")
+    fake.add(GOOD, 7, "player-one", team=3)
+    fake.add(OTHER, 9, "player-two", team=4)
+    fake.add(MATE, 8, "teammate", team=3)
+    fake.add(NOTEAM, 10, "loner", team=None)
     monkeypatch.setattr(instancer, "CTFD_VERIFY", True)
     monkeypatch.setattr(instancer, "CTFD_URL", "http://ctfd.test")
+    monkeypatch.setattr(instancer, "CTFD_SCOPE", "user")
     monkeypatch.setattr(urllib.request, "urlopen", fake.urlopen)
     return fake
+
+
+@pytest.fixture
+def team(ctfd, monkeypatch):
+    """The same CTFd, scoped to teams: GOOD and MATE are one team, OTHER another."""
+    monkeypatch.setattr(instancer, "CTFD_SCOPE", "team")
+    return ctfd
 
 
 # --- talking to the api -------------------------------------------------------
@@ -529,15 +541,15 @@ def test_a_verified_token_opens_the_door(ctfd, web, chal, daemon):
 def test_an_instance_is_named_after_the_account_not_the_session(ctfd, web, chal, daemon):
     verify(web)
     create(web, chal.id)
-    assert only_container(daemon).name.endswith("-" + instancer.ctfd_owner(7))
+    assert only_container(daemon).name.endswith("-" + instancer.ctfd_owner("user", 7))
 
 
 def test_an_account_id_names_an_owner_the_same_way_every_time():
     # Nothing secret goes into it and nothing per-process: an owner that moved
     # when the instancer restarted would be a second instance for every player.
-    assert instancer.ctfd_owner(7) == instancer.ctfd_owner(7)
-    assert instancer.ctfd_owner(7) != instancer.ctfd_owner(9)
-    assert re.fullmatch(r"[0-9a-f]{16}", instancer.ctfd_owner(7))
+    assert instancer.ctfd_owner("user", 7) == instancer.ctfd_owner("user", 7)
+    assert instancer.ctfd_owner("user", 7) != instancer.ctfd_owner("user", 9)
+    assert re.fullmatch(r"[0-9a-f]{16}", instancer.ctfd_owner("user", 7))
 
 
 def test_a_token_that_is_not_one_is_never_asked_about(ctfd, web, daemon):
@@ -557,7 +569,7 @@ def test_verify_without_a_token_is_not_a_crash(ctfd, web, daemon):
 
 
 def test_a_token_ctfd_does_not_know_gets_nothing(ctfd, web, chal, daemon):
-    response = verify(web, "ctfd_" + "c" * 64)
+    response = verify(web, "ctfd_" + "e" * 64)
     assert response.status_code == 403
     assert response.get_json() == {"ctfd": True, "verified": False,
                                    "error": instancer.ERROR_BAD_TOKEN}
@@ -663,6 +675,64 @@ def test_without_ctfd_no_page_asks_for_anything(web, chal, daemon):
 
 def test_verify_is_a_no_op_when_the_event_does_not_check_tokens(web, daemon):
     assert verify(web).get_json() == {"ctfd": False, "verified": True, "user": None}
+
+
+# --- one team, one instance ---------------------------------------------------
+
+def test_teammates_share_one_instance(team, web, other, chal, daemon):
+    verify(web, GOOD)
+    verify(other, MATE)                 # a different account, the same team
+    first = create(web, chal.id).get_json()
+    second = create(other, chal.id).get_json()
+    assert second["key"] == first["key"]
+    assert len(instances(daemon)) == 1
+
+
+def test_in_user_scope_the_same_two_get_one_each(ctfd, web, other, chal, daemon):
+    verify(web, GOOD)
+    verify(other, MATE)
+    create(web, chal.id)
+    create(other, chal.id)
+    assert len(instances(daemon)) == 2
+
+
+def test_two_teams_are_two_players(team, web, other, chal, daemon):
+    verify(web, GOOD)
+    verify(other, OTHER)                # team 4
+    create(web, chal.id)
+    create(other, chal.id)
+    assert len(instances(daemon)) == 2
+
+
+def test_an_instance_is_named_after_the_team(team, web, chal, daemon):
+    verify(web, GOOD)
+    create(web, chal.id)
+    assert only_container(daemon).name.endswith("-" + instancer.ctfd_owner("team", 3))
+
+
+def test_a_team_owner_is_not_the_user_owner_of_the_same_number():
+    assert instancer.ctfd_owner("team", 3) != instancer.ctfd_owner("user", 3)
+
+
+def test_an_account_with_no_team_is_told_to_join_one(team, web, chal, daemon):
+    response = verify(web, NOTEAM)
+    assert response.status_code == 403
+    assert response.get_json()["error"] == instancer.ERROR_NO_TEAM
+    assert create(web, chal.id).status_code == 403
+    assert instances(daemon) == []
+
+
+def test_a_teamless_account_is_fine_in_user_scope(ctfd, web, chal, daemon):
+    assert verify(web, NOTEAM).get_json()["verified"] is True
+    assert create(web, chal.id).get_json()["running"] is True
+
+
+def test_the_team_scope_shows_on_the_page(team, web, chal, daemon):
+    def text(path):
+        return " ".join(web.get(path).get_data(as_text=True).split())
+    assert "per team" in text("/c/%s" % chal.id)
+    verify(web, GOOD)
+    assert "per team" in text("/")
 
 
 # --- challenges (each challenge's own config.yml) -----------------------------

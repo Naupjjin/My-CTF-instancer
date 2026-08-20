@@ -46,7 +46,8 @@
       {% if ctfd_verify %}
       <p class="gate">
         {%- if ctfd_user -%}
-        verified as <b>{{ ctfd_user }}</b> &middot; one instance of each challenge per CTFd account
+        verified as <b>{{ ctfd_user }}</b> &middot; one instance of each challenge per
+        {{ 'team' if ctfd_scope == 'team' else 'CTFd account' }}
         {%- else -%}
         this event checks CTFd tokens: open a challenge and paste yours before you start it
         {%- endif -%}

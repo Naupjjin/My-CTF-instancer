@@ -97,8 +97,9 @@
           <span class="prompt">&gt;</span>
           <span id="who">{% if ctfd_user %}verified as {{ ctfd_user }}{% endif %}</span>
         </div>
-        <p class="note">one instance of each challenge per CTFd account. your token
-        is in CTFd under settings &rarr; access tokens.</p>
+        <p class="note">one instance of each challenge per
+        {{ 'team' if ctfd_scope == 'team' else 'CTFd account' }}. your token is in
+        CTFd under settings &rarr; access tokens.</p>
         <div class="row" id="ask-row" {{ 'hidden' if ctfd_user }}>
           <input id="token" type="password" placeholder="ctfd_..." spellcheck="false"
                  autocomplete="off" autocapitalize="off" aria-label="CTFd API token">

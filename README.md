@@ -1,8 +1,8 @@
 # SpawnZero
 
 A CTF instancer. Many challenges, one service, one instance of each per browser
-session — or per CTFd account, if you turn `CTFD_VERIFY` on. Creating an instance
-hands out four things nobody else has:
+session — or per CTFd account, or per CTFd team, if you turn `CTFD_VERIFY` on.
+Creating an instance hands out four things nobody else has:
 
 * a **container**,
 * a **subnet** — its own internal /24, with no gateway,
@@ -224,6 +224,7 @@ Defaults in brackets. The instancer:
 | `PROXY_TOKEN` | unset | the shared secret every proxy's own token is derived from |
 | `CTFD_VERIFY` | `n` | `y` makes a player a CTFd account instead of a browser session — see below |
 | `CTFD_URL` | unset | the CTFd to ask whose token it is; required when the above is on |
+| `CTFD_SCOPE` | `user` | `team` gives one instance per CTFd *team* instead of per account |
 | `CTFD_TIMEOUT` | `5` | seconds to wait for CTFd to answer |
 
 Only seven of these are written in `docker-compose.yml` — the two secrets, the UI
@@ -254,7 +255,7 @@ throwaway run. Do the same for `PROXY_TOKEN`: the shipped default is a
 placeholder, and an unset one makes the instancer refuse *every* key lookup, so
 nobody gets through any proxy at all.
 
-### CTFd — one account, one instance
+### CTFd — one account (or one team), one instance
 
 Off by default: a player is a browser session, and clearing cookies is a new
 player. That is fine for a practice box and not fine for a scored event, so:
@@ -290,8 +291,16 @@ cleared cookie or a shared token all land on the same instance and hand it back
 rather than opening another. (One *per challenge*, not one in total — the same
 account still gets one of every challenge at once, each on its own `ttl`.)
 
-The hash is plain SHA-256 of the account id, deliberately with nothing secret and
-nothing per-process in it: an owner id that moved when the instancer restarted
+**Team CTFs want `CTFD_SCOPE=team`.** Left at `user`, four teammates verify four
+tokens and take four instances of the same challenge, which is usually not what a
+team event means by one. With it set, the owner is the `team_id` that came back
+with the account, so the whole team shares one instance and one `ttl` per
+challenge — whoever presses START first opens it, and the others land on it. An
+account that has not joined a team has no identity to be: it is turned away with
+"join a team in CTFd first" rather than quietly given one of its own.
+
+The hash is plain SHA-256 of the account (or team) id, deliberately with nothing
+secret and nothing per-process in it: an owner id that moved when the instancer restarted
 would hand every player a second instance every time it came back up. It is a
 name, never a credential — the key is still the only credential, and there is a
 fresh one per instance.
@@ -434,7 +443,7 @@ the log.
 | `GET /` | the challenge list |
 | `GET /c/<chal>` | one challenge's page; `404` for a challenge that is not served |
 | `GET /api/challenges` | every challenge, and whether you have one running |
-| `POST /api/verify` | `{"token": "ctfd_…"}` → `{"ctfd": true, "verified": true, "user": ...}`; `403` for a token CTFd does not know, `503` when CTFd could not be asked. Only meaningful with `CTFD_VERIFY` on |
+| `POST /api/verify` | `{"token": "ctfd_…"}` → `{"ctfd": true, "verified": true, "user": ...}`; `403` for a token CTFd does not know — or, in team scope, an account with no team — `503` when CTFd could not be asked. Only meaningful with `CTFD_VERIFY` on |
 | `GET /api/<chal>/status` | your instance of it, or `{"running": false, ...}` |
 | `POST /api/<chal>/create` | your instance; returns the existing one if you already have it, `403`/`503`/`500` + `{"running": false, "error": ...}` on failure |
 | `POST /api/<chal>/destroy` | `{"running": false, ...}`, also when you had nothing running |
